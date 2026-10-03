@@ -519,12 +519,33 @@ def apply_browser_block(env: dict[str, str]) -> dict[str, str]:
     return env
 
 
+# agy picks its token storage per session. A registered account's HOME has no
+# keychain (deliberately: agy's keychain item has a fixed name, so a shared keychain
+# would let accounts overwrite each other's token). On every token refresh agy then
+# tries the keychain anyway, macOS pops "A keychain cannot be found to store
+# 'antigravity'", and agy falls back to its token file after a 5 s timeout. With an
+# SSH session detected agy goes straight to the file and never touches the keychain
+# (agy 1.2.16 log: "Using file-based token storage because SSH session detected").
+FILE_TOKEN_STORAGE_ENV = {"SSH_CONNECTION": "127.0.0.1 0 127.0.0.1 0"}
+
+
+def apply_file_token_storage(env: dict[str, str]) -> dict[str, str]:
+    """Make agy keep a registered account's token in its file, never the keychain.
+
+    Only for registered-account HOMEs: the host default account's token lives in the
+    real login keychain and must keep being read from there.
+    """
+    for key, value in FILE_TOKEN_STORAGE_ENV.items():
+        env.setdefault(key, value)
+    return env
+
+
 def probe_env(home_dir: str) -> dict[str, str]:
     """Environment for a read-only `agy` probe: isolated HOME, no browser launch."""
     env = os.environ.copy()
     env["HOME"] = str(Path(home_dir).expanduser().resolve())
     env.pop("ANTIGRAVITY_CONFIG_DIR", None)
-    return apply_browser_block(env)
+    return apply_file_token_storage(apply_browser_block(env))
 
 
 def fetch_usage_for_home(

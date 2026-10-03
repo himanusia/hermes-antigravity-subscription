@@ -59,3 +59,33 @@ class BrowserBlockTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FileTokenStorageTests(unittest.TestCase):
+    """Registered-account agy runs keep the token in its file, never the keychain.
+
+    A registered account's HOME has no keychain, so a keychain write on token refresh
+    pops macOS's "A keychain cannot be found" dialog. agy skips the keychain when it
+    detects an SSH session; the host default account must keep its real keychain.
+    """
+
+    def test_probe_env_selects_file_token_storage(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("SSH_CONNECTION", None)
+            env = accounts.probe_env("/tmp")
+        self.assertEqual(env["SSH_CONNECTION"], accounts.FILE_TOKEN_STORAGE_ENV["SSH_CONNECTION"])
+
+    def test_real_ssh_session_is_left_alone(self):
+        with patch.dict(os.environ, {"SSH_CONNECTION": "10.0.0.2 5000 10.0.0.1 22"}):
+            env = accounts.probe_env("/tmp")
+        self.assertEqual(env["SSH_CONNECTION"], "10.0.0.2 5000 10.0.0.1 22")
+
+    def test_client_env_only_for_registered_account_homes(self):
+        import tempfile
+        from client import AntigravityClient
+
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("SSH_CONNECTION", None)
+            client = AntigravityClient(cwd=tmp)
+            self.assertIn("SSH_CONNECTION", client._child_env(home_dir=tmp))
+            self.assertNotIn("SSH_CONNECTION", client._child_env())
