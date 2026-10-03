@@ -51,6 +51,7 @@ try:
     )
     from .stream import AntigravityStream, collect_stream_completion
     from .accounts import (
+        clear_session_pin,
         fetch_usage_for_home,
         get_rotation_mode,
         is_quota_error,
@@ -90,6 +91,7 @@ except ImportError:
     )
     from stream import AntigravityStream, collect_stream_completion
     from accounts import (
+        clear_session_pin,
         fetch_usage_for_home,
         get_rotation_mode,
         is_quota_error,
@@ -268,6 +270,39 @@ def _log_rotation_failover(
     logger.warning("[agy-rotate] %s -> %s", prev_part, next_part)
 
 
+def resolve_ambient_session_id(explicit: str | None = None) -> str | None:
+    """Resolve the session id binding this client's calls to one rotation pin.
+
+    Precedence: explicit arg (host passes ``session_id=`` on create() when it
+    knows it), then the ambient Hermes runtime (auxiliary_client publishes the
+    live main turn's ``session_id`` and rotation-stable ``cache_scope`` via
+    ``set_runtime_main``; portal_tags publishes the conversation root), then the
+    caller's ``session_id`` create() kwarg. All lookups are best-effort —
+    the host may be absent entirely (tests, standalone use): return None and
+    rotation simply runs unpinned.
+    """
+    sid = str(explicit or "").strip()
+    if sid:
+        return sid
+    try:
+        from agent.auxiliary_client import _runtime_main_value
+
+        sid = str(_runtime_main_value("cache_scope") or _runtime_main_value("session_id") or "").strip()
+        if sid:
+            return sid
+    except Exception:
+        pass
+    try:
+        from agent.portal_tags import get_affinity_scope, get_conversation_context
+
+        sid = str(get_affinity_scope() or get_conversation_context() or "").strip()
+        if sid:
+            return sid
+    except Exception:
+        pass
+    return None
+
+
 class _RotatingStreamWrapper:
     """Stream wrapper with turn 1 failover for quota exhaustion across accounts."""
 
@@ -284,6 +319,7 @@ class _RotatingStreamWrapper:
         initial_stream: Any,
         tried_labels: set[str],
         max_attempts: int = 3,
+        session_id: str | None = None,
     ) -> None:
         self.client = client
         self.resolved_model = resolved_model
@@ -296,6 +332,7 @@ class _RotatingStreamWrapper:
         self.current_stream = iter(initial_stream)
         self.tried_labels = set(tried_labels)
         self.max_attempts = max_attempts
+        self.session_id = session_id
         self.chunks_yielded = 0
 
     def _failover(self, exc: Exception) -> bool:
@@ -308,7 +345,11 @@ class _RotatingStreamWrapper:
         cooldown_ts = _resolve_cooldown_reset(self.current_account, self.resolved_model)
         set_cooldown(self.current_account["label"], until=cooldown_ts)
 
-        next_acc = pick_account(model=self.resolved_model, exclude_labels=self.tried_labels)
+        next_acc = pick_account(
+            model=self.resolved_model,
+            exclude_labels=self.tried_labels,
+            session_id=self.session_id,
+        )
         _log_rotation_failover(self.current_account, next_acc, self.resolved_model)
         if not next_acc:
             return False
@@ -835,6 +876,7 @@ class AntigravityClient:
         tool_choice: Any = None,
         stream: bool = False,
         reasoning_effort: str | None = None,
+        session_id: str | None = None,
         **extra_kwargs: Any,
     ) -> Any:
         if self.is_closed:
@@ -854,6 +896,12 @@ class AntigravityClient:
             if isinstance(timeout, (int, float)) and timeout > 0
             else _DEFAULT_TIMEOUT_SECONDS
         )
+        # Session stickiness binding: explicit kwarg, else the ambient Hermes
+        # runtime (aux runtime mirrors / conversation context). Purely advisory
+        # for rotation; a None result just means an unpinned pick.
+        eff_session_id = resolve_ambient_session_id(
+            session_id or extra_kwargs.get("session_id")
+        )
 
         rotation_mode = get_rotation_mode()
         if rotation_mode == "off":
@@ -872,7 +920,11 @@ class AntigravityClient:
         last_exc: Exception | None = None
 
         for attempt in range(max_attempts):
-            account = pick_account(model=resolved_model, exclude_labels=tried_labels)
+            account = pick_account(
+                model=resolved_model,
+                exclude_labels=tried_labels,
+                session_id=eff_session_id,
+            )
             if not account:
                 if not tried_labels:
                     # Fail-open: no accounts configured or registry error
@@ -918,6 +970,7 @@ class AntigravityClient:
                         initial_stream=raw_stream,
                         tried_labels=tried_labels,
                         max_attempts=max_attempts,
+                        session_id=eff_session_id,
                     )
                     update_last_used(label)
                     return wrapper
@@ -942,7 +995,11 @@ class AntigravityClient:
                     last_exc = exc
                     cooldown_ts = _resolve_cooldown_reset(account, resolved_model)
                     set_cooldown(label, until=cooldown_ts)
-                    next_acc = pick_account(model=resolved_model, exclude_labels=tried_labels)
+                    next_acc = pick_account(
+                        model=resolved_model,
+                        exclude_labels=tried_labels,
+                        session_id=eff_session_id,
+                    )
                     _log_rotation_failover(account, next_acc, resolved_model)
                     continue
                 raise

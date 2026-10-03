@@ -34,6 +34,19 @@ _USAGE_CACHE_LOCK = threading.Lock()
 _LEASE_LOCK = threading.Lock()
 _ACTIVE_LEASES: dict[str, int] = {}
 
+# In-memory session pins: session_id -> {"label": str, "ts": float}
+# Step 3 of the task brief: one account per session keeps the prompt prefix
+# stable and Google's KV/prompt cache warm. In-memory only (process restart
+# re-pins), guarded by a lock, entries expire after _SESSION_PIN_TTL.
+_SESSION_PIN_LOCK = threading.Lock()
+_SESSION_PINS: dict[str, dict[str, Any]] = {}
+_SESSION_PIN_TTL = 6 * 3600.0
+
+# In-memory quota-ignition bookkeeping: label -> monotonic-ish wall ts of the
+# last fired ignition (Once per 5h window, see maybe_quota_ignition).
+_IGNITION_LOCK = threading.Lock()
+_IGNITION_FIRED: dict[str, float] = {}
+
 
 @contextlib.contextmanager
 def _file_lock(lock_path: Path):
@@ -79,6 +92,7 @@ def _default_registry() -> dict[str, Any]:
         "version": 1,
         "accounts": [],
         "active_account": None,
+        "rotation_mode": "off",
     }
 
 
@@ -98,6 +112,8 @@ def load_accounts() -> dict[str, Any]:
             data["accounts"] = []
         if "active_account" not in data:
             data["active_account"] = None
+        if "rotation_mode" not in data:
+            data["rotation_mode"] = "off"
         return data
     except Exception as exc:
         logger.warning("Failed to read Antigravity accounts registry %s: %s (failing open)", path, exc)
@@ -452,9 +468,60 @@ def fetch_usage_for_home(
         return None
 
 
+VALID_ROTATION_MODES = ("off", "quota", "round_robin", "fixed")
+
+# Opt-in quota ignition: start the 5-hour usage window on an idle account so the
+# full budget is available when the user actually needs it. Disabled by default —
+# see `maybe_quota_ignition` for the triggers and safety rules.
+_QUOTA_IGNITION_IDLE_FRACTION = 0.999
+_QUOTA_IGNITION_TIMEOUT = 30.0
+_QUOTA_IGNITION_5H_WINDOW_HOURS = 5.0 * 3600.0
+
+
+def _registry_rotation_mode() -> str | None:
+    """Return rotation_mode stored in the registry, validating known modes."""
+    stored = load_accounts().get("rotation_mode")
+    if isinstance(stored, str):
+        stored = stored.strip().lower()
+        if stored in VALID_ROTATION_MODES:
+            return stored
+        logger.warning("Unknown rotation_mode %r in registry; ignoring it.", stored)
+    return None
+
+
 def get_rotation_mode() -> str:
-    """Return rotation mode from ANTIGRAVITY_ROTATION env var ('quota', 'round_robin', 'off')."""
-    return os.environ.get("ANTIGRAVITY_ROTATION", "off").strip().lower()
+    """Return the active rotation mode.
+
+    Precedence: ANTIGRAVITY_ROTATION env (session-level override), then the
+    persistent ``rotation_mode`` registry field, then ``off``.
+    """
+    env_mode = os.environ.get("ANTIGRAVITY_ROTATION", "").strip().lower()
+    if env_mode:
+        if env_mode in VALID_ROTATION_MODES:
+            return env_mode
+        logger.warning("Unknown ANTIGRAVITY_ROTATION %r; falling back to registry.", env_mode)
+    return _registry_rotation_mode() or "off"
+
+
+def set_rotation_mode(mode: str) -> bool:
+    """Persist rotation mode to the registry. Returns False on an unknown mode."""
+    norm = (mode or "").strip().lower()
+    if norm not in VALID_ROTATION_MODES:
+        logger.warning("Invalid rotation mode %r (valid: %s).", mode, ", ".join(VALID_ROTATION_MODES))
+        return False
+    data = load_accounts()
+    data["rotation_mode"] = norm
+    save_accounts(data)
+    return True
+
+
+def is_quota_ignition_enabled() -> bool:
+    """Return True when quota ignition is enabled via env or registry (opt-in)."""
+    env_val = os.environ.get("ANTIGRAVITY_QUOTA_IGNITION", "").strip().lower()
+    if env_val:
+        return env_val not in ("0", "false", "no", "off")
+    data = load_accounts()
+    return bool(data.get("quota_ignition", False))
 
 
 @contextlib.contextmanager
@@ -484,13 +551,134 @@ def calculate_score(
     in_cooldown: bool,
     lease_count: int = 0,
     eligible: bool = True,
+    reset_5h_time: str | None = None,
+    reset_week_time: str | None = None,
 ) -> float:
-    """Calculate account selection score with hard gate at 0%, cooldown, or ineligible."""
+    """Calculate the selection score with hard gate at 0%, cooldown, or ineligible.
+
+    Concurrency-Dampened DOCI shape (credit: prmartinow's CD-DOCI rotation):
+
+      base = f_5h * f_weekly^2
+      U_5h = (5.0 / (t_5h_hours + 0.5))^0.6      -- 5h replenishment urgency
+      U_w  = 7.0 / (t_week_days + 0.5)           -- weekly replenishment urgency
+      score = base * U_5h * U_w / (1 + leases)
+
+    A window about to reset scores higher: burning the remainder now instead of
+    letting it expire is the opportunity-cheap choice. Unknown/missing reset
+    times fall back to the full window length (5 h / 7 days), i.e. the minimum
+    urgency factor. Hard gates return 0.0 exactly.
+    """
     if not eligible or in_cooldown or f_5h <= 0.0 or f_weekly <= 0.0:
         return 0.0
-    raw_score = f_5h * (f_weekly ** 2)
+
+    now = time.time()
+    t_5h_hours = 5.0
+    reset_5h_ts = parse_reset_time(reset_5h_time)
+    if reset_5h_ts is not None:
+        t_5h_hours = max(0.001, (reset_5h_ts - now) / 3600.0)
+
+    t_week_days = 7.0
+    reset_week_ts = parse_reset_time(reset_week_time)
+    if reset_week_ts is not None:
+        t_week_days = max(0.001, (reset_week_ts - now) / 86400.0)
+
+    u_5h = (5.0 / (t_5h_hours + 0.5)) ** 0.6
+    u_w = 7.0 / (t_week_days + 0.5)
+    raw_score = f_5h * (f_weekly ** 2) * u_5h * u_w
     # Penalty for active leases ensures concurrent turns distribute evenly
     return raw_score / (1.0 + lease_count)
+
+
+def _quota_ignition_pinned(label: str) -> bool:
+    """Whether an ignition was already fired for this label near this 5h window."""
+    with _IGNITION_LOCK:
+        ts = _IGNITION_FIRED.get(label)
+    if ts is None:
+        return False
+    consumed = time.time() - ts
+    if consumed >= _QUOTA_IGNITION_5H_WINDOW_HOURS:
+        # Window must have rotated; forget the old stamp so the next idle
+        # stretch can fire again.
+        with _IGNITION_LOCK:
+            if _IGNITION_FIRED.get(label) == ts:
+                _IGNITION_FIRED.pop(label, None)
+        return False
+    return True
+
+
+def maybe_quota_ignition(
+    account: dict[str, Any],
+    usage: dict[str, Any] | None = None,
+    model_group: str = "gemini",
+) -> bool:
+    """Opt-in quota ignition: start an idle account's 5h window before use.
+
+    Disabled by default (env ANTIGRAVITY_QUOTA_IGNITION=1 or registry
+    ``quota_ignition: true``). Fires `HOME=<home> agy -p "Say: Ready"` ONCE per
+    (account, 5h window) when the account sits idle (5h remaining >= 0.999) —
+    quota is otherwise lost when the window resets. Never blocks the main
+    request beyond that single bounded call, never runs for disabled or
+    ineligible accounts, and never touches authentication state (a /usage read
+    is read-only; the ignition prompt is the same subprocess shape the
+    eligibility check already uses). Returns True when an ignition was fired.
+    """
+    label = str(account.get("label", "")).strip()
+    if not label:
+        return False
+    if not account.get("enabled", True):
+        return False
+    if not account.get("eligible", True):
+        return False
+    if not is_quota_ignition_enabled():
+        return False
+    if _quota_ignition_pinned(label):
+        return False
+
+    group = usage.get(model_group) if usage and isinstance(usage, dict) else None
+    if not isinstance(group, dict):
+        return False
+    f_5h = group.get("5h", {}).get("remaining_fraction", 0.0)
+    try:
+        f_5h = float(f_5h)
+    except (TypeError, ValueError):
+        return False
+    if f_5h < _QUOTA_IGNITION_IDLE_FRACTION:
+        return False
+
+    home_dir = str(account.get("home_dir", "") or "").strip()
+    if not home_dir or not Path(home_dir).is_dir():
+        return False
+
+    try:
+        cmd = resolve_agy_command()
+    except Exception:
+        return False
+
+    env = os.environ.copy()
+    env["HOME"] = str(Path(home_dir).resolve())
+    env.pop("ANTIGRAVITY_CONFIG_DIR", None)
+
+    try:
+        res = subprocess.run(
+            [cmd, "-p", "Say: Ready"],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=_QUOTA_IGNITION_TIMEOUT,
+            check=False,
+        )
+    except Exception:
+        return False
+    if res.returncode != 0:
+        logger.warning(
+            "quota ignition for %s exited rc=%d (ignoring)", label, res.returncode
+        )
+        return False
+
+    with _IGNITION_LOCK:
+        _IGNITION_FIRED[label] = time.time()
+    logger.info("quota ignition fired for account %s (5h window started)", label)
+    return True
 
 
 def is_quota_error(error: Exception | str) -> bool:
@@ -509,11 +697,65 @@ def is_quota_error(error: Exception | str) -> bool:
     )
 
 
+def _is_session_stickiness_enabled() -> bool:
+    env_val = os.environ.get("ANTIGRAVITY_SESSION_STICKINESS", "").strip().lower()
+    if env_val:
+        return env_val not in ("0", "false", "no", "off")
+    return True
+
+
+def _get_session_pin(session_id: str) -> str | None:
+    """Return the label pinned for this session, pruning stale pins as we go."""
+    now = time.time()
+    with _SESSION_PIN_LOCK:
+        # Cheap opportunistic sweep so pins don't accumulate across long sessions.
+        for sid in [s for s, p in _SESSION_PINS.items() if now - p.get("ts", 0.0) > _SESSION_PIN_TTL]:
+            _SESSION_PINS.pop(sid, None)
+        pin = _SESSION_PINS.get(session_id)
+        if pin is not None and now - pin.get("ts", 0.0) <= _SESSION_PIN_TTL:
+            return str(pin.get("label") or "")
+    return None
+
+
+def _set_session_pin(session_id: str, label: str) -> None:
+    with _SESSION_PIN_LOCK:
+        _SESSION_PINS[session_id] = {"label": label, "ts": time.time()}
+
+
+def clear_session_pin(session_id: str) -> None:
+    with _SESSION_PIN_LOCK:
+        _SESSION_PINS.pop(session_id, None)
+
+
+def _account_passes_gates(acc: dict[str, Any], now: float) -> bool:
+    """Enabled + eligible + not on cooldown."""
+    if not acc.get("enabled", True):
+        return False
+    if not acc.get("eligible", True):
+        return False
+    if float(acc.get("cooldown_until", 0.0) or 0.0) > now:
+        return False
+    return True
+
+
 def pick_account(
     model: str | None = None,
     exclude_labels: set[str] | list[str] | None = None,
+    session_id: str | None = None,
 ) -> dict[str, Any] | None:
     """Pick the best available Antigravity account based on configured rotation mode.
+
+    Mode precedence: env ANTIGRAVITY_ROTATION, else the registry's persistent
+    ``rotation_mode``, else 'off'.
+
+    'fixed' pins the account chosen by `set_active` (registry's
+    ``active_account``), or ANTIGRAVITY_ACCOUNT env (per-session override of the
+    pin). Fail-open: an unavailable pin account falls back to host default
+    (None).
+
+    'quota' / 'round_robin' honor per-session stickiness (see session_id):
+    once a session is pinned to an account it keeps that account (if it still
+    passes gates) so the prompt prefix and Google's prompt cache stay warm.
 
     Fails open by returning None on any registry missing/corrupt or mode 'off'.
     """
@@ -526,16 +768,48 @@ def pick_account(
         accounts = data.get("accounts", [])
         if not accounts:
             return None
+        by_label: dict[str, dict[str, Any]] = {
+            str(acc.get("label", "") or ""): acc for acc in accounts
+        }
 
         excluded = set(exclude_labels or [])
-        enabled_accounts = [
-            acc for acc in accounts
-            if acc.get("enabled", True)
-            and acc.get("eligible", True)
-            and acc.get("label") not in excluded
-        ]
-        if not enabled_accounts:
-            return None
+        if session_id and not _is_session_stickiness_enabled():
+            session_id = None  # stickiness disabled for this call
+
+        if mode == "fixed":
+            # Per-session env pin (ANTIGRAVITY_ACCOUNT) wins over the registry pin.
+            pin_label = ""
+            env_pin = os.environ.get("ANTIGRAVITY_ACCOUNT", "").strip()
+            if env_pin:
+                pin_label = env_pin
+            else:
+                pin_label = str(data.get("active_account") or "")
+                if not pin_label:
+                    return None  # fixed mode without a pin -> host default
+            acc = by_label.get(pin_label)
+            if acc is None or acc.get("label") in excluded or not _account_passes_gates(acc, time.time()):
+                what = "env pin" if env_pin else "active_account"
+                logger.warning(
+                    "rotation mode 'fixed': %s '%s' unavailable (missing, excluded, disabled, "
+                    "ineligible or on cooldown); failing open to host default.",
+                    what, pin_label,
+                )
+                return None
+            return acc
+
+        # Mode 'quota' / 'round_robin' + session stickiness
+        if session_id:
+            pinned_label = _get_session_pin(session_id)
+            if pinned_label:
+                pinned_acc = by_label.get(pinned_label)
+                if (
+                    pinned_acc is not None
+                    and pinned_acc.get("label") not in excluded
+                    and _account_passes_gates(pinned_acc, time.time())
+                ):
+                    return pinned_acc
+                # Pin went stale (removed / disabled / / ineligible / cooldown):
+                # reselect below and re-pin.
 
         now = time.time()
         m_lower = (model or "").lower()
@@ -543,42 +817,62 @@ def pick_account(
 
         if mode == "round_robin":
             eligible = [
-                acc for acc in enabled_accounts
-                if acc.get("cooldown_until", 0.0) <= now
+                acc for acc in accounts
+                if _account_passes_gates(acc, now) and acc.get("label") not in excluded
             ]
             if not eligible:
                 return None
             # Sort by active leases first (idle accounts preferred), then least recently used
             eligible.sort(key=lambda a: (get_lease_count(a["label"]), a.get("last_used", 0.0)))
-            return eligible[0]
+            chosen = eligible[0]
+        else:
+            # Default mode: 'quota'
+            scored: list[tuple[float, dict[str, Any], dict[str, Any] | None]] = []
+            for acc in accounts:
+                lbl = str(acc.get("label", "") or "")
+                if not lbl or lbl in excluded or not _account_passes_gates(acc, now):
+                    continue
+                f_5h = 1.0
+                f_weekly = 1.0
+                reset_5h: str | None = None
+                reset_week: str | None = None
+                usage = fetch_usage_for_home(acc.get("home_dir", ""), cached=True)
+                group = usage.get(group_key) if usage and isinstance(usage, dict) else None
+                if isinstance(group, dict):
+                    b5 = group.get("5h", {}) if isinstance(group.get("5h", {}), dict) else {}
+                    bwk = group.get("weekly", {}) if isinstance(group.get("weekly", {}), dict) else {}
+                    f_5h = b5.get("remaining_fraction", 1.0)
+                    f_weekly = bwk.get("remaining_fraction", 1.0)
+                    reset_5h = b5.get("reset_time") or None
+                    reset_week = bwk.get("reset_time") or None
 
-        # Default mode: 'quota'
-        scored: list[tuple[float, dict[str, Any]]] = []
-        for acc in enabled_accounts:
-            in_cooldown = acc.get("cooldown_until", 0.0) > now
-            f_5h = 1.0
-            f_weekly = 1.0
-            usage = fetch_usage_for_home(acc.get("home_dir", ""), cached=True)
-            if usage and group_key in usage:
-                f_5h = usage[group_key].get("5h", {}).get("remaining_fraction", 1.0)
-                f_weekly = usage[group_key].get("weekly", {}).get("remaining_fraction", 1.0)
+                score = calculate_score(
+                    f_5h=f_5h,
+                    f_weekly=f_weekly,
+                    in_cooldown=False,
+                    lease_count=get_lease_count(lbl),
+                    eligible=acc.get("eligible", True),
+                    reset_5h_time=reset_5h,
+                    reset_week_time=reset_week,
+                )
+                if score > 0.0:
+                    scored.append((score, acc, usage))
 
-            score = calculate_score(
-                f_5h=f_5h,
-                f_weekly=f_weekly,
-                in_cooldown=in_cooldown,
-                lease_count=get_lease_count(acc["label"]),
-                eligible=acc.get("eligible", True),
-            )
-            if score > 0.0:
-                scored.append((score, acc))
+            if not scored:
+                return None
 
-        if not scored:
-            return None
+            # Highest score first
+            scored.sort(key=lambda x: x[0], reverse=True)
+            chosen = scored[0][1]
+            # Opt-in quota ignition: if the winner's 5h window is idle, spend ONE
+            # bounded subprocess call to start it (else that quota expires when
+            # the window resets). Best-effort — failure never blocks the request.
+            maybe_quota_ignition(chosen, usage=scored[0][2], model_group=group_key)
 
-        # Highest score first
-        scored.sort(key=lambda x: x[0], reverse=True)
-        return scored[0][1]
+        if session_id:
+            # Keep this session on the chosen account until it becomes unusable.
+            _set_session_pin(session_id, str(chosen.get("label", "")))
+        return chosen
     except Exception as exc:
         logger.warning("pick_account failed open: %s", exc)
         return None

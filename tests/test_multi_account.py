@@ -7,6 +7,7 @@ import sys
 import tempfile
 import time
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -22,6 +23,7 @@ from accounts import (
     add_account,
     calculate_score,
     check_account_eligibility,
+    clear_session_pin,
     extract_email_from_token_file,
     fetch_usage_for_home,
     find_account_token_path,
@@ -29,10 +31,12 @@ from accounts import (
     get_active,
     get_lease_count,
     get_rotation_mode,
+    is_quota_ignition_enabled,
     is_quota_error,
     lease_account,
     list_accounts,
     load_accounts,
+    maybe_quota_ignition,
     parse_reset_time,
     pick_account,
     remove_account,
@@ -40,7 +44,9 @@ from accounts import (
     save_accounts,
     set_active,
     set_cooldown,
+    set_rotation_mode,
     update_last_used,
+    VALID_ROTATION_MODES,
 )
 from __init__ import antigravity_profile, auth_handler
 from client import AntigravityClient, _log_rotation_failover, _resolve_cooldown_reset
@@ -135,10 +141,23 @@ class TestMultiAccount(unittest.TestCase):
         self.tmp_dir.cleanup()
 
     def test_calculate_score_and_hard_gate(self):
-        # Standard score: f_5h * (f_weekly ** 2)
-        # 0.9494 * (0.9849 ** 2) = 0.9494 * 0.970028 = 0.92094
+        # Base score f_5h * f_weekly^2 scaled by replenishment urgency. With no reset
+        # times the urgency is the full-window minimum: U_5h = (5/5.5)^0.6, U_w = 7/7.5.
+        u_5h = (5.0 / 5.5) ** 0.6
+        u_w = 7.0 / 7.5
         score = calculate_score(f_5h=0.9494, f_weekly=0.9849, in_cooldown=False)
-        self.assertAlmostEqual(score, 0.9494 * (0.9849**2), places=4)
+        self.assertAlmostEqual(score, 0.9494 * (0.9849 ** 2) * u_5h * u_w, places=6)
+
+        # A window about to reset scores higher than one that has just reset.
+        soon = (datetime.now(timezone.utc) + timedelta(minutes=20)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        later = (datetime.now(timezone.utc) + timedelta(days=6)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        score_soon = calculate_score(
+            f_5h=1.0, f_weekly=1.0, in_cooldown=False, reset_5h_time=soon, reset_week_time=later
+        )
+        score_later = calculate_score(
+            f_5h=1.0, f_weekly=1.0, in_cooldown=False, reset_5h_time=later, reset_week_time=later
+        )
+        self.assertGreater(score_soon, score_later)
 
         # Hard gate: 0% in 5h
         self.assertEqual(calculate_score(f_5h=0.0, f_weekly=1.0, in_cooldown=False), 0.0)
@@ -151,8 +170,8 @@ class TestMultiAccount(unittest.TestCase):
         # Active lease adds penalty to divisor: raw / (1 + lease_count)
         score_idle = calculate_score(f_5h=1.0, f_weekly=1.0, in_cooldown=False, lease_count=0)
         score_busy = calculate_score(f_5h=1.0, f_weekly=1.0, in_cooldown=False, lease_count=1)
-        self.assertEqual(score_idle, 1.0)
-        self.assertEqual(score_busy, 0.5)
+        self.assertGreater(score_idle, 0.0)
+        self.assertAlmostEqual(score_busy, score_idle / 2.0, places=9)
 
         # Verify lease contextmanager
         self.assertEqual(get_lease_count("acc1"), 0)

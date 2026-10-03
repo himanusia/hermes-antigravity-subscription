@@ -382,6 +382,11 @@ def antigravity_auth_handler(action: str, args: Any) -> bool:
         active = get_active()
         rotation_mode = get_rotation_mode()
 
+        mode_source = "env ANTIGRAVITY_ROTATION" if os.environ.get("ANTIGRAVITY_ROTATION", "").strip() else "registry"
+        print(f"Rotation mode: {rotation_mode} (source: {mode_source})")
+        if rotation_mode == "fixed":
+            print(f"Pinned account: {active or '(none; using host default)'}")
+
         headers = ["Label", "Active", "Enabled", "Eligible", "Cooldown", "Gemini (5h / Wk)", "Claude/GPT (5h / Wk)"]
         row_format = "{:<22} {:<8} {:<9} {:<10} {:<12} {:<20} {:<20}"
         divider = "-" * 105
