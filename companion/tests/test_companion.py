@@ -82,7 +82,7 @@ class ProbeTests(unittest.TestCase):
 
     def test_probe_eligible_parses_windows(self):
         with self._run(stdout=json.dumps(USAGE_JSON)):
-            eligible, windows, note = accounts.probe(Path.home())
+            eligible, windows, note, resets = accounts.probe(Path.home())
         self.assertTrue(eligible)
         self.assertEqual(note, "")
         self.assertAlmostEqual(windows["gemini_5h"], 0.5)
@@ -90,19 +90,19 @@ class ProbeTests(unittest.TestCase):
 
     def test_probe_ineligible(self):
         with self._run(stdout="error: Eligibility check failed: Your current account is not eligible for Antigravity."):
-            eligible, windows, note = accounts.probe(Path.home())
+            eligible, windows, note, resets = accounts.probe(Path.home())
         self.assertFalse(eligible)
         self.assertIn("not eligible", note)
 
     def test_probe_not_signed_in(self):
         with self._run(stdout="Please sign in to view available models."):
-            eligible, _, note = accounts.probe(Path.home())
+            eligible, _, note, _ = accounts.probe(Path.home())
         self.assertIsNone(eligible)
         self.assertEqual(note, "not signed in")
 
     def test_probe_timeout(self):
         with patch("accounts.subprocess.run", side_effect=accounts.subprocess.TimeoutExpired(cmd="agy", timeout=1)):
-            eligible, _, note = accounts.probe(Path.home())
+            eligible, _, note, _ = accounts.probe(Path.home())
         self.assertIsNone(eligible)
         self.assertEqual(note, "timeout")
 
@@ -139,11 +139,13 @@ class AccountListingTests(unittest.TestCase):
 
 
 class CommandTests(unittest.TestCase):
-    def _list_output(self, probe_result, accounts_list, fast=False):
+    def _list_output(self, probe_result, accounts_list, fast=False, active=""):
         out = io.StringIO()
+        if len(probe_result) == 3:
+            probe_result = probe_result + ({},)
         with patch("accounts.list_accounts", return_value=accounts_list), patch(
             "accounts.probe", return_value=probe_result
-        ), patch("sys.stdout", out):
+        ), patch("accounts.active_store_name", return_value=active), patch("sys.stdout", out):
             code = _cmd_list(fast=fast)
         return code, out.getvalue()
 
@@ -171,7 +173,7 @@ class CommandTests(unittest.TestCase):
         account = {"label": "bad", "home": Path("/tmp/bad"), "email": "bad@example.com", "host": False}
         out = io.StringIO()
         with patch("accounts.resolve_account", return_value=account), patch(
-            "accounts.probe", return_value=(False, {}, "not eligible for Antigravity")
+            "accounts.probe", return_value=(False, {}, "not eligible for Antigravity", {})
         ), patch("sys.stdout", out):
             code = _cmd_usage("bad")
         self.assertEqual(code, 1)

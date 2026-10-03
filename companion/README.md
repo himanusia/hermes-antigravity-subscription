@@ -27,6 +27,9 @@ hermes antigravity list --fast       # no quota probes (no agy calls)
 hermes antigravity run <account>     # open agy interactively as that account
 hermes antigravity run <account> -p "hello"   # one-shot; arguments pass through to agy
 hermes antigravity usage [account]   # remaining quota for one account (default: host)
+hermes antigravity use <account>     # make that account the active one ('host' restores the default)
+hermes antigravity mode [mode]       # show or set rotation: off | quota | round_robin | fixed
+hermes antigravity ignite [on|off]   # opt-in: wake the 5h window on an idle account
 ```
 
 `host` is the original HOME account. Other accounts are read from
@@ -40,6 +43,10 @@ and `ANTIGRAVITY_ACCOUNTS_FILE`).
   reports `num_turns: 0` and consumes no subscription quota.
 * Accounts that are signed in but not eligible for Antigravity are marked `NO`
   and reported with a `WARNING`. Eligible accounts print no warning.
+* `list` shows a `RESET` column with the next quota refresh ("in 4h 12m").
+  `use`, `mode`, and `ignite` persist into the same registry keys the provider
+  plugin reads (`active_account`, `rotation_mode`, `quota_ignition`), so these
+  commands change provider behaviour rather than only printing state.
 * Tokens are never printed. The account email is read from the `id_token` JWT
   payload inside the local token file.
 * On macOS a keychain dialog may appear while `agy` stores its session; it can be

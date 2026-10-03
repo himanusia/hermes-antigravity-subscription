@@ -211,9 +211,12 @@ hermes antigravity list              # accounts, eligibility, quota, home direct
 hermes antigravity list --fast       # skip quota probes (no agy calls)
 hermes antigravity run <account>     # open agy interactively as that account
 hermes antigravity usage [account]   # remaining quota for one account
+hermes antigravity use <account>     # make that account the active one (host restores default)
+hermes antigravity mode [mode]       # show or set rotation: off | quota | round_robin | fixed
+hermes antigravity ignite [on|off]   # opt-in: wake the 5h window on an idle account
 ```
 
-Accounts that are signed in but not eligible are marked `NO` and reported with a warning. Eligible accounts print no warning. Details in `companion/README.md`.
+`list` shows eligibility, both quota windows, a RESET countdown, and the home directory. Accounts that are signed in but not eligible are marked `NO` and reported with a warning; eligible accounts print no warning. `use`, `mode`, and `ignite` write the registry keys the provider plugin reads (`active_account`, `rotation_mode`, `quota_ignition`). Details in `companion/README.md`.
 
 ---
 
