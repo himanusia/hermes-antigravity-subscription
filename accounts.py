@@ -64,6 +64,14 @@ def get_accounts_file_path() -> Path:
     return DEFAULT_ACCOUNTS_FILE
 
 
+def get_accounts_dir() -> Path:
+    """Return path to accounts directory, respecting ANTIGRAVITY_ACCOUNTS_DIR env var."""
+    env_dir = os.environ.get("ANTIGRAVITY_ACCOUNTS_DIR", "").strip()
+    if env_dir:
+        return Path(env_dir).expanduser().resolve()
+    return DEFAULT_ACCOUNTS_DIR
+
+
 def _default_registry() -> dict[str, Any]:
     return {
         "version": 1,

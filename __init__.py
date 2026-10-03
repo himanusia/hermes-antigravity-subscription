@@ -6,7 +6,37 @@ import logging
 import os
 import re
 import subprocess
+import sys
+import time
+from pathlib import Path
 from typing import Any
+
+try:
+    from .accounts import (
+        DEFAULT_ACCOUNTS_DIR,
+        add_account,
+        fetch_usage_for_home,
+        get_accounts_dir,
+        get_active,
+        list_accounts,
+        remove_account,
+        set_active,
+        set_cooldown,
+    )
+    from .process import _link_macos_keychains, resolve_agy_command
+except ImportError:
+    from accounts import (
+        DEFAULT_ACCOUNTS_DIR,
+        add_account,
+        fetch_usage_for_home,
+        get_accounts_dir,
+        get_active,
+        list_accounts,
+        remove_account,
+        set_active,
+        set_cooldown,
+    )
+    from process import _link_macos_keychains, resolve_agy_command
 
 from providers import register_provider
 from providers.base import ProviderProfile
@@ -202,6 +232,190 @@ def _classify_antigravity_error(
     return None
 
 
+def antigravity_auth_handler(action: str, args: Any) -> bool:
+    """Provider-owned auth handler for `hermes auth add|status|logout|refresh`.
+
+    Called by Hermes Agent when managing credentials for Antigravity.
+    Returns True when the action was handled by this plugin, False to fall through.
+    """
+    if action == "add":
+        if not sys.stdin.isatty():
+            raise SystemExit(
+                "Error: 'hermes auth add antigravity-subscription-directsdk' requires an interactive terminal (TTY) "
+                "so you can complete the browser-based Google authentication."
+            )
+
+        label = (getattr(args, "label", None) or "").strip()
+        if not label:
+            try:
+                label = input("Account label: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                raise SystemExit(1)
+        if not label:
+            raise SystemExit("Error: --label is required and cannot be empty.")
+
+        accounts_dir = get_accounts_dir()
+        home_dir = accounts_dir / label
+        home_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            home_dir.chmod(0o700)
+        except OSError:
+            pass
+
+        if sys.platform == "darwin":
+            _link_macos_keychains(home_dir)
+
+        try:
+            cmd = resolve_agy_command()
+        except Exception as exc:
+            raise SystemExit(f"Error resolving agy CLI: {exc}")
+
+        env = os.environ.copy()
+        env["HOME"] = str(home_dir)
+        env.pop("ANTIGRAVITY_CONFIG_DIR", None)
+
+        print(f"Opening agy in {home_dir} for account '{label}'...")
+        print("Please complete the sign-in prompt in your browser if requested.")
+        res = subprocess.run([cmd], env=env, check=False)
+        if res.returncode != 0:
+            raise SystemExit(f"agy exited with code {res.returncode}.")
+
+        add_account(label=label, home_dir=str(home_dir), enabled=True)
+        print(f"Successfully saved account '{label}' to registry.")
+        return True
+
+    if action == "status":
+        accounts = list_accounts()
+        active = get_active()
+        if not accounts:
+            print(
+                "No Antigravity accounts registered.\n"
+                "Run `hermes auth add antigravity-subscription-directsdk --label <name>` to add an account."
+            )
+            return True
+
+        headers = ["Label", "Active", "Enabled", "Cooldown", "Gemini (5h / Wk)", "Claude/GPT (5h / Wk)"]
+        row_format = "{:<16} {:<8} {:<9} {:<12} {:<20} {:<20}"
+        print(row_format.format(*headers))
+        print("-" * 85)
+
+        now = time.time()
+        for acc in accounts:
+            lbl = acc.get("label", "")
+            is_act = "*" if lbl == active else ""
+            en = "yes" if acc.get("enabled", True) else "no"
+            cd_until = acc.get("cooldown_until", 0.0)
+            if cd_until > now:
+                cd_str = f"{int(cd_until - now)}s"
+            else:
+                cd_str = "ready"
+
+            usage = fetch_usage_for_home(acc.get("home_dir", ""), cached=False)
+            if usage:
+                g_5h = usage.get("gemini", {}).get("5h", {}).get("remaining_fraction")
+                g_wk = usage.get("gemini", {}).get("weekly", {}).get("remaining_fraction")
+                c_5h = usage.get("claude_gpt", {}).get("5h", {}).get("remaining_fraction")
+                c_wk = usage.get("claude_gpt", {}).get("weekly", {}).get("remaining_fraction")
+
+                gemini_str = (
+                    f"{int(g_5h * 100)}% / {int(g_wk * 100)}%"
+                    if g_5h is not None and g_wk is not None
+                    else "n/a"
+                )
+                claude_str = (
+                    f"{int(c_5h * 100)}% / {int(c_wk * 100)}%"
+                    if c_5h is not None and c_wk is not None
+                    else "n/a"
+                )
+            else:
+                gemini_str = "unknown"
+                claude_str = "unknown"
+
+            print(row_format.format(lbl, is_act, en, cd_str, gemini_str, claude_str))
+        return True
+
+    if action in ("logout", "remove"):
+        target = (getattr(args, "target", None) or getattr(args, "label", None) or "").strip()
+        if target:
+            if remove_account(target):
+                print(f"Account '{target}' removed from registry. Home directory preserved.")
+                return True
+            else:
+                raise SystemExit(f"Error: Account '{target}' not found in registry.")
+
+        accounts = list_accounts()
+        if not accounts:
+            print("No Antigravity accounts registered.")
+            return True
+
+        if len(accounts) == 1:
+            lbl = accounts[0]["label"]
+            remove_account(lbl)
+            print(f"Account '{lbl}' removed from registry. Home directory preserved.")
+            return True
+
+        if sys.stdin.isatty():
+            print("Registered Antigravity accounts:")
+            for i, acc in enumerate(accounts, 1):
+                print(f"  {i}. {acc['label']}")
+            try:
+                choice = input("Enter label to remove (or 'all' to remove all): ").strip()
+            except (EOFError, KeyboardInterrupt):
+                raise SystemExit(1)
+            if choice.lower() == "all":
+                for acc in accounts:
+                    remove_account(acc["label"])
+                print(f"All {len(accounts)} accounts removed from registry. Home directories preserved.")
+                return True
+            elif choice:
+                if remove_account(choice):
+                    print(f"Account '{choice}' removed from registry. Home directory preserved.")
+                    return True
+                else:
+                    raise SystemExit(f"Error: Account '{choice}' not found in registry.")
+            else:
+                raise SystemExit("Error: No account selected.")
+
+        for acc in accounts:
+            remove_account(acc["label"])
+        print(f"Logged out of Antigravity ({len(accounts)} account(s) removed from registry). Home directories preserved.")
+        return True
+
+    if action == "refresh":
+        target = (getattr(args, "target", None) or getattr(args, "label", None) or "").strip()
+        if target:
+            accounts = {acc["label"]: acc for acc in list_accounts()}
+            if target not in accounts:
+                raise SystemExit(f"Error: Account '{target}' not found in registry.")
+            set_cooldown(target, until=0.0)
+            fetch_usage_for_home(accounts[target].get("home_dir", ""), cached=False)
+            print(f"Cleared cooldown and refreshed quota for '{target}'.")
+            return True
+
+        accounts = list_accounts()
+        if not accounts:
+            print("No Antigravity accounts registered.")
+            return True
+        for acc in accounts:
+            lbl = acc["label"]
+            set_cooldown(lbl, until=0.0)
+            fetch_usage_for_home(acc.get("home_dir", ""), cached=False)
+        print(f"Cleared cooldowns and refreshed quota for {len(accounts)} account(s).")
+        return True
+
+    if action == "use":
+        target = (getattr(args, "target", None) or getattr(args, "label", None) or "").strip()
+        if not target:
+            raise SystemExit("Error: target/label is required.")
+        if set_active(target):
+            print(f"Active account set to '{target}'.")
+            return True
+        else:
+            raise SystemExit(f"Error: Account '{target}' not found in registry.")
+
+    return False
+
+
 antigravity_profile = AntigravitySubscriptionDirectSDKProfile(
     name="antigravity-subscription-directsdk",
     aliases=("antigravity", "agy", "antigravity-directsdk"),
@@ -218,24 +432,8 @@ antigravity_profile = AntigravitySubscriptionDirectSDKProfile(
     fallback_models=_FALLBACK_MODELS,
     supports_vision=True,
     classify_api_error=_classify_antigravity_error,
+    auth_handler=antigravity_auth_handler,
 )
 
+auth_handler = antigravity_auth_handler
 register_provider(antigravity_profile)
-
-
-def register(ctx: Any) -> None:
-    """Plugin entry point for Hermes Agent discovery.
-
-    Registers CLI subcommands (hermes antigravity ...) if supported by ctx.
-    """
-    if hasattr(ctx, "register_cli_command"):
-        try:
-            from .cli import setup_cli
-        except ImportError:
-            from cli import setup_cli
-        ctx.register_cli_command(
-            name="antigravity",
-            help="Antigravity multi-account login and quota rotation",
-            setup_fn=setup_cli,
-            description="Manage multiple Google Antigravity accounts and quota rotation.",
-        )

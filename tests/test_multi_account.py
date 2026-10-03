@@ -37,7 +37,7 @@ from accounts import (
     set_cooldown,
     update_last_used,
 )
-from cli import cmd_accounts, cmd_login, cmd_remove, cmd_use, setup_cli
+from __init__ import antigravity_profile, auth_handler
 from client import AntigravityClient, _log_rotation_failover, _resolve_cooldown_reset
 
 SAMPLE_USAGE_JSON = json.dumps({
@@ -92,10 +92,12 @@ class TestMultiAccount(unittest.TestCase):
     def setUp(self):
         self.tmp_dir = tempfile.TemporaryDirectory()
         self.accounts_file = Path(self.tmp_dir.name) / "accounts.json"
+        self.accounts_dir = Path(self.tmp_dir.name) / "agy-accounts"
         self.env_patch = patch.dict(
             os.environ,
             {
                 "ANTIGRAVITY_ACCOUNTS_FILE": str(self.accounts_file),
+                "ANTIGRAVITY_ACCOUNTS_DIR": str(self.accounts_dir),
                 "ANTIGRAVITY_ROTATION": "quota",
             },
         )
@@ -345,40 +347,104 @@ class TestMultiAccount(unittest.TestCase):
                     )
                 self.assertIn("quota", str(ctx.exception).lower())
 
-    def test_cli_subcommands(self):
-        # Test setup_cli
-        parser = argparse.ArgumentParser()
-        setup_cli(parser)
-
-        # Test cmd_login non-interactive fails
+    def test_auth_handler_add_non_interactive_fails(self):
         with patch("sys.stdin.isatty", return_value=False):
-            code = cmd_login(argparse.Namespace(label="test_login"))
-            self.assertEqual(code, 1)
+            with self.assertRaises(SystemExit) as ctx:
+                auth_handler("add", SimpleNamespace(label="test_login"))
+            self.assertIn("requires an interactive terminal", str(ctx.exception))
 
-        # Test cmd_accounts empty
+    def test_auth_handler_add_interactive_success(self):
+        with patch("sys.stdin.isatty", return_value=True):
+            with patch("subprocess.run") as mock_run, patch("__init__.resolve_agy_command", return_value="agy"):
+                mock_run.return_value = SimpleNamespace(returncode=0)
+                res = auth_handler("add", SimpleNamespace(label="test_add"))
+                self.assertTrue(res)
+                accounts = list_accounts()
+                self.assertEqual(len(accounts), 1)
+                self.assertEqual(accounts[0]["label"], "test_add")
+                env_passed = mock_run.call_args[1]["env"]
+                self.assertTrue(env_passed["HOME"].endswith("test_add"))
+
+    def test_auth_handler_add_agy_failure(self):
+        with patch("sys.stdin.isatty", return_value=True):
+            with patch("subprocess.run") as mock_run, patch("__init__.resolve_agy_command", return_value="agy"):
+                mock_run.return_value = SimpleNamespace(returncode=1)
+                with self.assertRaises(SystemExit) as ctx:
+                    auth_handler("add", SimpleNamespace(label="test_fail"))
+                self.assertIn("code 1", str(ctx.exception))
+
+    def test_auth_handler_status_empty(self):
         out = io.StringIO()
         with patch("sys.stdout", out):
-            cmd_accounts(argparse.Namespace())
+            res = auth_handler("status", SimpleNamespace())
+        self.assertTrue(res)
         self.assertIn("No Antigravity accounts registered", out.getvalue())
 
-        # Add account and test cmd_accounts output
+    def test_auth_handler_status_with_accounts(self):
         add_account("acc_alpha", "/path/alpha")
         set_active("acc_alpha")
         out = io.StringIO()
         with patch("sys.stdout", out):
-            cmd_accounts(argparse.Namespace())
+            res = auth_handler("status", SimpleNamespace())
+        self.assertTrue(res)
         self.assertIn("acc_alpha", out.getvalue())
-        self.assertIn("*", out.getvalue())  # active indicator
+        self.assertIn("*", out.getvalue())
 
-        # Test cmd_use
-        code = cmd_use(argparse.Namespace(label="acc_alpha"))
-        self.assertEqual(code, 0)
+    def test_auth_handler_refresh(self):
+        add_account("acc_alpha", "/path/alpha")
+        set_cooldown("acc_alpha", duration_seconds=600)
+
+        with patch("accounts.fetch_usage_for_home", return_value=None):
+            # Target refresh
+            res = auth_handler("refresh", SimpleNamespace(target="acc_alpha"))
+            self.assertTrue(res)
+            acc = list_accounts()[0]
+            self.assertEqual(acc["cooldown_until"], 0.0)
+
+            # Global refresh
+            set_cooldown("acc_alpha", duration_seconds=600)
+            res = auth_handler("refresh", SimpleNamespace(target=None))
+            self.assertTrue(res)
+            acc = list_accounts()[0]
+            self.assertEqual(acc["cooldown_until"], 0.0)
+
+            # Nonexistent target
+            with self.assertRaises(SystemExit):
+                auth_handler("refresh", SimpleNamespace(target="nonexistent"))
+
+    def test_auth_handler_logout_target_and_all(self):
+        add_account("acc1", "/path/1")
+        add_account("acc2", "/path/2")
+
+        # Logout target
+        res = auth_handler("logout", SimpleNamespace(target="acc1"))
+        self.assertTrue(res)
+        self.assertEqual(len(list_accounts()), 1)
+
+        # Logout nonexistent target
+        with self.assertRaises(SystemExit):
+            auth_handler("logout", SimpleNamespace(target="acc1"))
+
+        # Logout remaining account (single account path)
+        res = auth_handler("logout", SimpleNamespace(target=None))
+        self.assertTrue(res)
+        self.assertEqual(len(list_accounts()), 0)
+
+        # Logout empty
+        res = auth_handler("logout", SimpleNamespace(target=None))
+        self.assertTrue(res)
+
+    def test_auth_handler_use_and_unhandled(self):
+        add_account("acc_alpha", "/path/alpha")
+        res = auth_handler("use", SimpleNamespace(target="acc_alpha"))
+        self.assertTrue(res)
         self.assertEqual(get_active(), "acc_alpha")
 
-        # Test cmd_remove
-        code = cmd_remove(argparse.Namespace(label="acc_alpha"))
-        self.assertEqual(code, 0)
-        self.assertEqual(len(list_accounts()), 0)
+        with self.assertRaises(SystemExit):
+            auth_handler("use", SimpleNamespace(target="nonexistent"))
+
+        # Unhandled action returns False
+        self.assertFalse(auth_handler("unknown_action", SimpleNamespace()))
 
     def test_log_rotation_failover_format(self):
         acc1 = {"label": "acc2", "home_dir": "/path/2"}
