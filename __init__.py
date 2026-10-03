@@ -168,6 +168,22 @@ class AntigravitySubscriptionDirectSDKProfile(ProviderProfile):
             model=model,
         )
 
+    def fetch_account_usage(
+        self,
+        *,
+        base_url: str | None = None,
+        api_key: str | None = None,
+        force_refresh: bool = False,
+        **kwargs: Any,
+    ) -> Any:
+        """Fetch subscription quota snapshot for /usage, status bar, and desktop."""
+        try:
+            from .usage import get_account_usage_snapshot
+        except ImportError:
+            from usage import get_account_usage_snapshot
+
+        return get_account_usage_snapshot(force_refresh=force_refresh)
+
 
 def _classify_antigravity_error(
     error: Exception,
@@ -221,3 +237,64 @@ antigravity_profile = AntigravitySubscriptionDirectSDKProfile(
 )
 
 register_provider(antigravity_profile)
+
+
+def register(ctx: Any) -> None:
+    """Register Antigravity subscription usage tool, slash command, and CLI command."""
+    try:
+        from .usage import (
+            ANTIGRAVITY_USAGE_TOOL_SCHEMA,
+            handle_agy_usage_cli,
+            handle_agy_usage_slash_command,
+            handle_antigravity_usage_tool,
+            setup_agy_usage_cli,
+        )
+        from .client import is_authenticated
+    except ImportError:
+        from usage import (
+            ANTIGRAVITY_USAGE_TOOL_SCHEMA,
+            handle_agy_usage_cli,
+            handle_agy_usage_slash_command,
+            handle_antigravity_usage_tool,
+            setup_agy_usage_cli,
+        )
+        from client import is_authenticated
+
+    # Register tool if supported by context (agent can check quota)
+    if hasattr(ctx, "register_tool"):
+        try:
+            ctx.register_tool(
+                name="antigravity_usage",
+                toolset="antigravity",
+                schema=ANTIGRAVITY_USAGE_TOOL_SCHEMA,
+                handler=handle_antigravity_usage_tool,
+                check_fn=is_authenticated,
+                emoji="📊",
+                description="Check current Antigravity subscription quota and remaining limits.",
+            )
+        except Exception as exc:
+            logger.debug("Failed to register antigravity_usage tool: %s", exc)
+
+    # Register in-session slash command (/agy-usage)
+    if hasattr(ctx, "register_command"):
+        try:
+            ctx.register_command(
+                "agy-usage",
+                handler=handle_agy_usage_slash_command,
+                description="Check Google Antigravity subscription quota and rate limits.",
+            )
+        except Exception as exc:
+            logger.debug("Failed to register agy-usage slash command: %s", exc)
+
+    # Register CLI subcommand (hermes agy-usage)
+    if hasattr(ctx, "register_cli_command"):
+        try:
+            ctx.register_cli_command(
+                name="agy-usage",
+                help="Check Google Antigravity subscription quota and rate limits",
+                setup_fn=setup_agy_usage_cli,
+                handler_fn=handle_agy_usage_cli,
+                description="Query and display Antigravity subscription limits for Gemini and Claude/GPT models.",
+            )
+        except Exception as exc:
+            logger.debug("Failed to register agy-usage CLI command: %s", exc)
