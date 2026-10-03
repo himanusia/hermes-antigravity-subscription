@@ -543,6 +543,25 @@ class TestMultiAccount(unittest.TestCase):
         self.assertIn("acc_alpha", val)
         self.assertIn("Home:", val)
 
+    def test_auth_handler_status_warns_only_for_ineligible(self):
+        add_account("acc_ok", "/path/ok", eligible=True)
+        add_account("acc_bad", "/path/bad", eligible=False)
+        out = io.StringIO()
+        with patch("sys.stdout", out), patch("accounts.fetch_usage_for_home", return_value=None):
+            res = auth_handler("status", SimpleNamespace())
+        self.assertTrue(res)
+        warnings = [line for line in out.getvalue().splitlines() if line.startswith("WARNING")]
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("acc_bad", warnings[0])
+        self.assertNotIn("acc_ok", warnings[0])
+
+    def test_auth_handler_status_quiet_when_all_eligible(self):
+        add_account("acc_ok", "/path/ok", eligible=True)
+        out = io.StringIO()
+        with patch("sys.stdout", out), patch("accounts.fetch_usage_for_home", return_value=None):
+            auth_handler("status", SimpleNamespace())
+        self.assertNotIn("WARNING", out.getvalue())
+
     def test_auth_handler_refresh(self):
         add_account("acc_alpha", "/path/alpha")
         set_cooldown("acc_alpha", duration_seconds=600)

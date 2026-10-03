@@ -361,7 +361,7 @@ def antigravity_auth_handler(action: str, args: Any) -> bool:
 
         print(f"Successfully saved account '{final_label}' to registry.")
         if is_eligible:
-            print("Status: Eligible for Antigravity subscription quota.")
+            # Eligible accounts stay quiet: no warning, just the current quota.
             if usage_data:
                 g_5h = usage_data.get("gemini", {}).get("5h", {}).get("remaining_fraction")
                 g_wk = usage_data.get("gemini", {}).get("weekly", {}).get("remaining_fraction")
@@ -372,8 +372,8 @@ def antigravity_auth_handler(action: str, args: Any) -> bool:
                 if c_5h is not None and c_wk is not None:
                     print(f"  Claude/GPT Quota (5h / Wk): {int(c_5h * 100)}% / {int(c_wk * 100)}%")
         else:
-            print("Status: NOT eligible for Antigravity subscription quota.")
-            print("Notice: Account is registered but will be bypassed during quota rotation.")
+            print("WARNING: this account is NOT eligible for the Antigravity subscription.")
+            print("WARNING: it stays registered but quota rotation will skip it.")
 
         return True
 
@@ -443,6 +443,11 @@ def antigravity_auth_handler(action: str, args: Any) -> bool:
         if not accounts:
             print("\n(No additional Antigravity accounts registered.)")
             print("Run `hermes auth add antigravity-subscription-directsdk` to add an account.")
+
+        # Warn only about accounts that cannot be used; eligible accounts stay quiet.
+        ineligible = [acc.get("label", "") for acc in accounts if not acc.get("eligible", True)]
+        if ineligible:
+            print(f"\nWARNING: not eligible for Antigravity (skipped by rotation): {', '.join(ineligible)}")
 
         return True
 
