@@ -212,6 +212,7 @@ hermes antigravity list --fast       # skip quota probes (no agy calls)
 hermes antigravity run <account>     # open agy interactively as that account
 hermes antigravity usage [account]   # remaining quota for one account
 hermes antigravity use <account>     # make that account the active one (host restores default)
+hermes antigravity add [--label <name>]   # sign in a new Google account
 hermes antigravity mode [mode]       # show or set rotation: off | quota | round_robin | fixed
 hermes antigravity ignite [on|off]   # opt-in: wake the 5h window on an idle account
 ```

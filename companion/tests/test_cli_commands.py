@@ -15,7 +15,7 @@ if str(PLUGIN_DIR) not in sys.path:
     sys.path.insert(0, str(PLUGIN_DIR))
 
 import accounts  # noqa: E402
-from cli import _cmd_ignite, _cmd_list, _cmd_mode, _cmd_use, antigravity_command  # noqa: E402
+from cli import _cmd_add, _cmd_ignite, _cmd_list, _cmd_mode, _cmd_use, antigravity_command  # noqa: E402
 
 
 class RegistryContractTests(unittest.TestCase):
@@ -220,6 +220,41 @@ class UseModeIgniteTests(unittest.TestCase):
             code = antigravity_command(type("A", (), {})())
         self.assertEqual(code, 2)
         self.assertIn("Usage: hermes antigravity", out.getvalue())
+
+
+class AddCommandTests(unittest.TestCase):
+    def test_add_without_tty_refuses_and_points_to_the_real_command(self):
+        out = io.StringIO()
+        with patch("sys.stdin") as stdin, patch("sys.stdout", out), patch("cli.subprocess.call") as call:
+            stdin.isatty.return_value = False
+            code = _cmd_add("")
+        self.assertEqual(code, 2)
+        self.assertIn("interactive terminal", out.getvalue())
+        self.assertIn("hermes auth add antigravity-subscription-directsdk", out.getvalue())
+        call.assert_not_called()
+
+    def test_add_forwards_label_to_auth_add(self):
+        out = io.StringIO()
+        with patch("sys.stdin") as stdin, patch("sys.stdout", out), patch(
+            "cli.shutil.which", return_value="/usr/local/bin/hermes"
+        ), patch("cli.subprocess.call", return_value=0) as call:
+            stdin.isatty.return_value = True
+            code = _cmd_add("work")
+        self.assertEqual(code, 0)
+        call.assert_called_once_with(
+            ["/usr/local/bin/hermes", "auth", "add", "antigravity-subscription-directsdk", "--label", "work"]
+        )
+
+    def test_add_without_label_omits_the_flag(self):
+        with patch("sys.stdin") as stdin, patch("sys.stdout", io.StringIO()), patch(
+            "cli.shutil.which", return_value="/usr/local/bin/hermes"
+        ), patch("cli.subprocess.call", return_value=0) as call:
+            stdin.isatty.return_value = True
+            code = _cmd_add("")
+        self.assertEqual(code, 0)
+        call.assert_called_once_with(
+            ["/usr/local/bin/hermes", "auth", "add", "antigravity-subscription-directsdk"]
+        )
 
 
 if __name__ == "__main__":

@@ -28,6 +28,7 @@ hermes antigravity run <account>     # open agy interactively as that account
 hermes antigravity run <account> -p "hello"   # one-shot; arguments pass through to agy
 hermes antigravity usage [account]   # remaining quota for one account (default: host)
 hermes antigravity use <account>     # make that account the active one ('host' restores the default)
+hermes antigravity add [--label <name>]   # sign in a new Google account (opens the sign-in flow)
 hermes antigravity mode [mode]       # show or set rotation: off | quota | round_robin | fixed
 hermes antigravity ignite [on|off]   # opt-in: wake the 5h window on an idle account
 ```

@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import argparse
 import os
+import shutil
+import subprocess
 import sys
 
 try:
@@ -34,6 +36,9 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
 
     p_use = subs.add_parser("use", help="Switch the active account in the registry")
     p_use.add_argument("label", help="Account label, or 'host' to return to the host default")
+
+    p_add = subs.add_parser("add", help="Sign in a new Google account and register it")
+    p_add.add_argument("--label", default="", help="Optional label (defaults to the account email)")
 
     p_mode = subs.add_parser("mode", help="Show or set the rotation mode")
     p_mode.add_argument(
@@ -62,6 +67,8 @@ def antigravity_command(args: argparse.Namespace) -> int:
         return _cmd_usage(str(getattr(args, "label", accounts.HOST_LABEL) or accounts.HOST_LABEL))
     if action == "use":
         return _cmd_use(str(getattr(args, "label", "")))
+    if action == "add":
+        return _cmd_add(str(getattr(args, "label", "") or ""))
     if action == "mode":
         return _cmd_mode(str(getattr(args, "mode", "") or ""))
     if action == "ignite":
@@ -129,6 +136,7 @@ def _cmd_list(fast: bool) -> int:
         print(f"\nWARNING: not eligible for Antigravity (skipped by quota rotation): {', '.join(ineligible)}")
 
     print("\nRun an account:   hermes antigravity run <account>")
+    print("Add an account:   hermes antigravity add [--label <name>]")
     print("One-shot:         hermes antigravity run <account> -p \"...\"")
     print("Quota:            hermes antigravity usage [account]")
     print("Switch account:   hermes antigravity use <account>")
@@ -199,6 +207,28 @@ def _cmd_use(label: str) -> int:
     accounts.set_active_label(str(account["label"]))
     print(f"Active account: {account['label']}")
     return 0
+
+
+def _cmd_add(label: str) -> int:
+    """Register a new account by delegating to the provider's official sign-in flow.
+
+    The sign-in (Google OAuth, token file persistence, eligibility check) lives in
+    the provider plugin's `auth_handler`, reached through `hermes auth add`. We only
+    forward the call so there is a single implementation, and so credentials are
+    never touched by this plugin.
+    """
+    if not sys.stdin.isatty():
+        print("`hermes antigravity add` needs an interactive terminal (it opens the Google sign-in).")
+        print("Run it from your terminal, or directly:")
+        print("  hermes auth add antigravity-subscription-directsdk --label <name>")
+        return 2
+    exe = shutil.which("hermes") or "hermes"
+    cmd = [exe, "auth", "add", "antigravity-subscription-directsdk"]
+    wanted = (label or "").strip()
+    if wanted:
+        cmd += ["--label", wanted]
+    print(f"Signing in a new account{' as ' + wanted if wanted else ''}...")
+    return subprocess.call(cmd)
 
 
 def _cmd_mode(mode: str) -> int:
