@@ -23,7 +23,7 @@ try:
         set_active,
         set_cooldown,
     )
-    from .process import _link_macos_keychains, resolve_agy_command
+    from .process import resolve_agy_command
 except ImportError:
     from accounts import (
         DEFAULT_ACCOUNTS_DIR,
@@ -36,7 +36,7 @@ except ImportError:
         set_active,
         set_cooldown,
     )
-    from process import _link_macos_keychains, resolve_agy_command
+    from process import resolve_agy_command
 
 from providers import register_provider
 from providers.base import ProviderProfile
@@ -262,8 +262,10 @@ def antigravity_auth_handler(action: str, args: Any) -> bool:
         except OSError:
             pass
 
-        if sys.platform == "darwin":
-            _link_macos_keychains(home_dir)
+        # Additional accounts stay fully isolated: no host keychain link. On macOS agy
+        # keeps its session in $HOME/Library/Keychains (service "gemini", account
+        # "antigravity"), so linking the host keychain here would let the new account
+        # reuse or overwrite the existing account credential.
 
         try:
             cmd = resolve_agy_command()
