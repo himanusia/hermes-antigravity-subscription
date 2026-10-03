@@ -192,6 +192,31 @@ agent:
 
 ---
 
+## Companion CLI (`hermes antigravity ...`)
+
+This repository also ships a companion plugin that adds CLI commands for the accounts this provider uses. A `kind: model-provider` plugin never receives `register(ctx)` (`hermes_cli/plugins_discovery.py` skips the kind; `hermes_cli/plugin_validate.py` treats such an entry point as dead code), so the CLI lives in a normal standalone plugin under `companion/`.
+
+Install it beside the provider:
+
+```sh
+git clone --depth 1 https://github.com/himanusia/hermes-antigravity-subscription /tmp/agy-plugin
+cp -r /tmp/agy-plugin/companion ~/.hermes/plugins/antigravity-companion
+hermes plugins enable antigravity-companion
+```
+
+Commands:
+
+```sh
+hermes antigravity list              # accounts, eligibility, quota, home directory
+hermes antigravity list --fast       # skip quota probes (no agy calls)
+hermes antigravity run <account>     # open agy interactively as that account
+hermes antigravity usage [account]   # remaining quota for one account
+```
+
+Accounts that are signed in but not eligible are marked `NO` and reported with a warning. Eligible accounts print no warning. Details in `companion/README.md`.
+
+---
+
 ## Tests
 
 Run the test suite:
