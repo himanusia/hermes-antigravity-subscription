@@ -166,6 +166,47 @@ class TestUsageParser(unittest.TestCase):
         self.assertIsNone(parse_agy_usage({"command": {"name": "other"}}))
         self.assertIsNone(parse_agy_usage({"command": {"name": "usage", "data": {}}}))
 
+    def test_parse_stream_json_alternative_envelopes(self):
+        command = SAMPLE_AGY_USAGE_JSON["command"]
+
+        # Envelope variant A: event/command_result wrapper carrying the command
+        variant_a = '{"event":"command_result","command":' + json.dumps(command) + "}"
+        usage_a = parse_agy_usage(variant_a)
+        assert usage_a is not None
+        self.assertEqual(len(usage_a.groups), 2)
+
+        # Envelope variant B: result-wrapped full response object
+        variant_b = json.dumps(
+            {"event": "result", "result": SAMPLE_AGY_USAGE_JSON}
+        )
+        usage_b = parse_agy_usage(variant_b)
+        assert usage_b is not None
+        self.assertEqual(len(usage_b.groups), 2)
+
+        # Envelope variant C: bare usage object with no command wrapper at all
+        variant_c = json.dumps(command["data"])
+        usage_c = parse_agy_usage(variant_c)
+        assert usage_c is not None
+        self.assertEqual(len(usage_c.groups), 2)
+
+        # Mixed multi-line stream with unrelated events around the payload
+        mixed = (
+            '{"event":"init","conversation_id":"abc"}\n'
+            '{"event":"progress","message":"querying"}\n'
+            + variant_a
+            + "\n"
+            '{"event":"done"}\n'
+        )
+        usage_mixed = parse_agy_usage(mixed)
+        assert usage_mixed is not None
+        self.assertEqual(len(usage_mixed.groups), 2)
+
+        # Lines that fail to parse or lack usage data are tolerated
+        junk = "not json\n[1, 2, 3]\n" + variant_b
+        usage_junk = parse_agy_usage(junk)
+        assert usage_junk is not None
+        self.assertEqual(len(usage_junk.groups), 2)
+
 
 class TestDateTimeAndFormatting(unittest.TestCase):
     def test_parse_iso_datetime(self):
@@ -196,9 +237,13 @@ class TestDateTimeAndFormatting(unittest.TestCase):
         in_2h_15m = datetime(2026, 10, 3, 14, 15, 0, tzinfo=timezone.utc)
         self.assertEqual(format_countdown(in_2h_15m, now), "in 2h 15m")
 
-        # Days and hours
-        in_6d_16h = datetime(2026, 10, 10, 4, 30, 0, tzinfo=timezone.utc)
-        self.assertEqual(format_countdown(in_6d_16h, now), "in 6d 16h")
+        # Days, hours and minutes (minutes included when days > 0)
+        in_6d_16h_30m = datetime(2026, 10, 10, 4, 30, 0, tzinfo=timezone.utc)
+        self.assertEqual(format_countdown(in_6d_16h_30m, now), "in 6d 16h 30m")
+
+        # Days without remaining hours/minutes
+        in_3d = datetime(2026, 10, 6, 12, 0, 0, tzinfo=timezone.utc)
+        self.assertEqual(format_countdown(in_3d, now), "in 3d 0h 0m")
 
     def test_format_reset_time(self):
         self.assertEqual(format_reset_time(None), "unknown")
@@ -288,7 +333,13 @@ class TestCachingAndQuery(unittest.TestCase):
 
         # Simulate failure on refresh
         mock_query.return_value = None
+        # force_refresh must NOT silently serve stale data — the caller asked
+        # for fresh data, so failure should be surfaced as None.
         stale = fetch_subscription_usage(force_refresh=True)
+        self.assertIsNone(stale)
+
+        # Non-forced callers still get the stale-cache fallback on failure.
+        stale = fetch_subscription_usage()
         self.assertEqual(stale, sample_usage)
 
     @patch("usage.resolve_agy_command", return_value="/nonexistent/agy")

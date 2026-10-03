@@ -109,7 +109,7 @@ def format_countdown(dt: datetime | None, now: datetime | None = None) -> str:
     hours, rem = divmod(rem, 3600)
     minutes = rem // 60
     if days > 0:
-        return f"in {days}d {hours}h"
+        return f"in {days}d {hours}h {minutes}m"
     if hours > 0:
         return f"in {hours}h {minutes}m"
     return f"in {minutes}m"
@@ -120,6 +120,28 @@ def format_reset_time(dt: datetime | None) -> str:
     if dt is None:
         return "unknown"
     return dt.strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
+def _find_groups_data(node: Any, depth: int = 0) -> dict[str, Any] | None:
+    """Recursively locate the usage payload: the first dict with a 'groups' key.
+
+    Accepts the plain `{"command": {"name": "usage", "data": {..., "groups":
+    [...]}}}` envelope plus any structural variation (e.g. `{"result":
+    {"command": ...}}` or `{"event": "command_result", ...}` or a bare usage
+    object), as long as a nested dict carries a `groups` list. Depth-limited to
+    avoid pathological recursion on adversarial input.
+    """
+    if not isinstance(node, dict) or depth > 15:
+        return None
+    if isinstance(node.get("groups"), list) and any(
+        isinstance(g, dict) for g in node["groups"]
+    ):
+        return node
+    for value in node.values():
+        found = _find_groups_data(value, depth + 1)
+        if found is not None:
+            return found
+    return None
 
 
 def parse_agy_usage(payload: Any) -> SubscriptionUsage | None:
@@ -139,36 +161,31 @@ def parse_agy_usage(payload: Any) -> SubscriptionUsage | None:
             if isinstance(parsed, dict):
                 raw_dict = parsed
         except json.JSONDecodeError:
-            # Maybe stream-json (multiple JSON lines)
+            # Stream-json: multiple JSON lines, each possibly wrapped in an
+            # event envelope. Don't assume a fixed structure — scan every line
+            # for a usage-shaped payload instead of hardcoding the two known
+            # nestings, and debug-log whatever gets skipped.
             for line in cleaned.splitlines():
                 line_str = line.strip()
                 if not line_str:
                     continue
                 try:
                     item = json.loads(line_str)
-                    if isinstance(item, dict):
-                        # Look for event=command_result or result with command
-                        if item.get("command", {}).get("name") == "usage":
-                            raw_dict = item
-                            break
-                        if item.get("result", {}).get("command", {}).get("name") == "usage":
-                            raw_dict = item["result"]
-                            break
                 except json.JSONDecodeError:
+                    logger.debug("Skipping non-JSON stream line: %.80s", line_str)
                     continue
+                if not isinstance(item, dict):
+                    logger.debug("Skipping non-object stream line: %.80s", line_str)
+                    continue
+                if _find_groups_data(item) is not None:
+                    raw_dict = item
+                    break
+                logger.debug("Skipping stream line without usage payload: %.80s", line_str)
 
     if not raw_dict:
         return None
 
-    # Extract command node
-    cmd_node = raw_dict.get("command")
-    if not cmd_node and isinstance(raw_dict.get("result"), dict):
-        cmd_node = raw_dict["result"].get("command")
-
-    if not isinstance(cmd_node, dict):
-        return None
-
-    data = cmd_node.get("data")
+    data = _find_groups_data(raw_dict)
     if not isinstance(data, dict):
         return None
 
@@ -278,16 +295,34 @@ def fetch_subscription_usage(
     """
     global _cached_usage, _cached_timestamp
 
+    # Fast path: serve fresh cache without touching the subprocess at all.
+    # The lock is held ONLY for this snapshot check — never during the subprocess
+    # call, which can block for up to `timeout` seconds and would otherwise
+    # serialize every caller (status bar, agent tool, slash command) behind it.
     now = time.time()
     with _cache_lock:
-        if not force_refresh and _cached_usage is not None and (now - _cached_timestamp) < USAGE_CACHE_TTL_SECONDS:
+        if (
+            not force_refresh
+            and _cached_usage is not None
+            and (now - _cached_timestamp) < USAGE_CACHE_TTL_SECONDS
+        ):
             return _cached_usage
 
-        usage = _query_agy_usage(timeout=timeout)
+    # Subprocess runs OUTSIDE the lock: concurrent callers may each spawn an
+    # `agy` query, but none blocks another thread that holds or awaits the lock.
+    usage = _query_agy_usage(timeout=timeout)
+
+    with _cache_lock:
         if usage is not None:
             _cached_usage = usage
             _cached_timestamp = time.time()
             return usage
+
+        if force_refresh:
+            # The user explicitly asked for fresh data; silently serving stale
+            # cache would mask the refresh failure. Report it instead.
+            logger.debug("force_refresh requested but query failed; not serving stale cache")
+            return None
 
         # Fallback to stale cache if available on transient failure
         if _cached_usage is not None:
