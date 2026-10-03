@@ -253,6 +253,11 @@ def _query_agy_usage(timeout: float = 8.0) -> SubscriptionUsage | None:
     try:
         isolated_home, _ = setup_isolated_home(tmp_dir)
         env = build_child_env(isolated_home)
+        try:  # a quota probe must never open a browser window
+            from .accounts import apply_browser_block
+        except ImportError:
+            from accounts import apply_browser_block
+        env = apply_browser_block(env)
         res = subprocess.run(
             [cmd, "-p", "/usage", "--output-format", "json"],
             env=env,

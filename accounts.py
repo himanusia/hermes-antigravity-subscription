@@ -10,6 +10,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from datetime import datetime, timezone
@@ -209,9 +210,7 @@ def check_account_eligibility(
     except Exception:
         return False, None
 
-    env = os.environ.copy()
-    env["HOME"] = norm_home
-    env.pop("ANTIGRAVITY_CONFIG_DIR", None)
+    env = probe_env(norm_home)
 
     try:
         res = subprocess.run(
@@ -421,6 +420,69 @@ def _parse_usage_json(raw_json: str) -> dict[str, Any] | None:
         return None
 
 
+_NO_BROWSER_LOCK = threading.Lock()
+_NO_BROWSER_DIR: str | None = None
+
+
+def is_browser_block_enabled() -> bool:
+    """Whether probe subprocesses are blocked from launching a browser. Default: on.
+
+    Disable with ANTIGRAVITY_BLOCK_BROWSER=0 (only useful for interactive
+    sign-in, where a browser window is the whole point).
+    """
+    val = os.environ.get("ANTIGRAVITY_BLOCK_BROWSER", "").strip().lower()
+    return val not in ("0", "false", "no", "off")
+
+
+def _no_browser_shim_dir() -> str:
+    """Directory holding `open`/`xdg-open` shims that refuse to launch a browser.
+
+    `agy` opens the system browser when it decides a session needs re-login.
+    A quota probe (list, `/usage`, status bar, desktop) must never do that:
+    unattended probes would pop a Chrome tab the user never asked for. We
+    prepend this directory to PATH so those helpers fail instead of launching.
+    """
+    global _NO_BROWSER_DIR
+    with _NO_BROWSER_LOCK:
+        if _NO_BROWSER_DIR and os.path.isdir(_NO_BROWSER_DIR):
+            return _NO_BROWSER_DIR
+        shim_dir = os.path.join(tempfile.gettempdir(), "agy-nobrowser")
+        os.makedirs(shim_dir, exist_ok=True)
+        for name in ("open", "xdg-open"):
+            path = os.path.join(shim_dir, name)
+            try:
+                with open(path, "w", encoding="utf-8") as handle:
+                    handle.write(
+                        '#!/bin/sh\n'
+                        'echo "blocked browser launch (agy probe): $*" >&2\n'
+                        "exit 1\n"
+                    )
+                os.chmod(path, 0o755)
+            except OSError:
+                return ""
+        _NO_BROWSER_DIR = shim_dir
+        return shim_dir
+
+
+def apply_browser_block(env: dict[str, str]) -> dict[str, str]:
+    """Block a subprocess env from launching a browser (BROWSER + `open` shim)."""
+    if not is_browser_block_enabled():
+        return env
+    env["BROWSER"] = "/usr/bin/false"
+    shim_dir = _no_browser_shim_dir()
+    if shim_dir:
+        env["PATH"] = shim_dir + os.pathsep + env.get("PATH", "")
+    return env
+
+
+def probe_env(home_dir: str) -> dict[str, str]:
+    """Environment for a read-only `agy` probe: isolated HOME, no browser launch."""
+    env = os.environ.copy()
+    env["HOME"] = str(Path(home_dir).expanduser().resolve())
+    env.pop("ANTIGRAVITY_CONFIG_DIR", None)
+    return apply_browser_block(env)
+
+
 def fetch_usage_for_home(
     home_dir: str,
     timeout: float = 30.0,
@@ -443,9 +505,7 @@ def fetch_usage_for_home(
     except Exception:
         return None
 
-    env = os.environ.copy()
-    env["HOME"] = norm_home
-    env.pop("ANTIGRAVITY_CONFIG_DIR", None)
+    env = probe_env(norm_home)
 
     try:
         res = subprocess.run(
@@ -654,9 +714,7 @@ def maybe_quota_ignition(
     except Exception:
         return False
 
-    env = os.environ.copy()
-    env["HOME"] = str(Path(home_dir).resolve())
-    env.pop("ANTIGRAVITY_CONFIG_DIR", None)
+    env = probe_env(home_dir)
 
     try:
         res = subprocess.run(
