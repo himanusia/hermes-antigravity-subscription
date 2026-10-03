@@ -27,6 +27,8 @@ _MODEL_ALIASES = {
     "flash": "gemini-3.8-flash",
     "gemini-flash": "gemini-3.8-flash",
     "gemini-3.8": "gemini-3.8-flash",
+    "gemini-3.8-max": "gemini-3.8-flash-high",
+    "gemini-max": "gemini-3.8-flash-high",
     "pro": "gemini-3.1-pro",
     "gemini-pro": "gemini-3.1-pro",
     "gemini-3.1": "gemini-3.1-pro",
