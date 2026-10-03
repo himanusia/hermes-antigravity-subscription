@@ -8,6 +8,8 @@ versa. Every test starts from: no registered accounts, rotation off.
 
 from __future__ import annotations
 
+import sys
+
 import pytest
 
 
@@ -20,4 +22,17 @@ def _isolate_antigravity_env(tmp_path, monkeypatch):
     monkeypatch.delenv("ANTIGRAVITY_FAILOVER", raising=False)
     monkeypatch.delenv("ANTIGRAVITY_SESSION_STICKINESS", raising=False)
     monkeypatch.delenv("ANTIGRAVITY_QUOTA_IGNITION", raising=False)
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _no_real_agy_model_probe(monkeypatch):
+    """pick_account probes `agy models` per account; never spawn the real CLI from tests.
+
+    An empty listing means "unknown" and fails open, which keeps rotation tests
+    independent of the machine's accounts. Tests that need a listing patch it.
+    """
+    for name, mod in list(sys.modules.items()):
+        if name.split(".")[-1] == "accounts" and hasattr(mod, "list_models_for_home"):
+            monkeypatch.setattr(mod, "list_models_for_home", lambda home_dir, timeout=15.0: ())
     yield

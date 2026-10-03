@@ -69,6 +69,39 @@ _FALLBACK_MODELS = (
 )
 
 
+def _rotation_accounts() -> list[dict[str, Any]]:
+    """Registered accounts that can serve a request (enabled and eligible)."""
+    try:
+        return [
+            a for a in list_accounts()
+            if isinstance(a, dict) and a.get("enabled", True) and a.get("eligible", True)
+        ]
+    except Exception:
+        return []
+
+
+def _clean_agy_models(stdout: str) -> list[str]:
+    """Parse `agy models` output into deduplicated base names (Gemini effort suffixes folded)."""
+    clean_models: list[str] = []
+    seen: set[str] = set()
+    for raw_line in (stdout or "").strip().splitlines():
+        line = raw_line.strip()
+        if not line or "fetching" in line.lower():
+            continue
+        parts = line.split()
+        if not parts or not any(c in parts[0].lower() for c in ("gemini", "claude", "gpt", "model")):
+            continue
+        m = base = parts[0]
+        for suffix in ("-high", "-medium", "-low"):
+            if m.endswith(suffix) and (m.startswith("gemini-") or "flash" in m or "pro" in m):
+                base = m[:-len(suffix)]
+                break
+        if base not in seen:
+            seen.add(base)
+            clean_models.append(base)
+    return clean_models
+
+
 class AntigravitySubscriptionDirectSDKProfile(ProviderProfile):
     """Google Antigravity Subscription DirectSDK provider profile."""
 
@@ -134,49 +167,20 @@ class AntigravitySubscriptionDirectSDKProfile(ProviderProfile):
         the thinking depth cleanly.
         """
         try:
-            from .client import resolve_agy_command
-        except ImportError:
-            # Loaded outside a package (e.g. a flat source tree under test):
-            # the absolute name is the same module.
-            from client import resolve_agy_command
-
-        cmd = resolve_agy_command()
-        try:
-            try:  # a model-listing probe must never open a browser window
-                from .accounts import apply_browser_block
+            try:
+                from .accounts import list_models_for_home
             except ImportError:
-                from accounts import apply_browser_block
+                from accounts import list_models_for_home
 
-            res = subprocess.run(
-                [cmd, "models"],
-                env=apply_browser_block(dict(os.environ)),
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-            )
-            raw_models: list[str] = []
-            for raw_line in res.stdout.strip().splitlines():
-                line = raw_line.strip()
-                if not line or "fetching" in line.lower():
-                    continue
-                parts = line.split()
-                if parts:
-                    model_id = parts[0]
-                    if any(c in model_id.lower() for c in ("gemini", "claude", "gpt", "model")):
-                        raw_models.append(model_id)
-
-            if raw_models:
-                clean_models: list[str] = []
-                seen: set[str] = set()
-                for m in raw_models:
-                    base = m
-                    for suffix in ("-high", "-medium", "-low"):
-                        if m.endswith(suffix) and (m.startswith("gemini-") or "flash" in m or "pro" in m):
-                            base = m[:-len(suffix)]
-                            break
-                    if base not in seen:
-                        seen.add(base)
-                        clean_models.append(base)
+            # Model access is per Google account. The host default account (real HOME)
+            # serves any model no rotation account has (pick_account skips accounts
+            # without the model), so offer the union of every usable account's models.
+            homes = [None] + [a["home_dir"] for a in _rotation_accounts() if a.get("home_dir")]
+            raw: list[str] = []
+            for home in homes:
+                raw.extend(list_models_for_home(home, timeout=timeout))
+            clean_models = _clean_agy_models("\n".join(raw))
+            if clean_models:
                 return clean_models
         except Exception as exc:
             logger.debug("Antigravity fetch_models failed: %s", exc)

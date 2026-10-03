@@ -864,6 +864,57 @@ def _account_has_quota(acc: dict[str, Any], group_key: str) -> bool:
     return f_5h > 0.0 and f_weekly > 0.0
 
 
+_MODELS_CACHE: dict[str, tuple[float, tuple[str, ...]]] = {}
+_MODELS_CACHE_LOCK = threading.Lock()
+# Model access changes rarely, and every probe may refresh the account's token
+# (on macOS that refresh pops the "keychain cannot be found" dialog), so probe seldom.
+_MODELS_CACHE_TTL = 6 * 3600.0
+# A failed probe is remembered briefly so a broken account costs one timeout, not one per request.
+_MODELS_FAILURE_TTL = 300.0
+
+
+def list_models_for_home(home_dir: str | None, timeout: float = 15.0) -> tuple[str, ...]:
+    """Raw `agy models` ids one account can use (cached); empty when unknown.
+
+    ``home_dir=None`` lists the host default account (the real HOME). Model access
+    is per Google account: one account may list Claude 5.5 while another only has
+    4.6, and agy exits on a ``--model`` its account does not list.
+    """
+    key = str(home_dir or "")
+    now = time.time()
+    with _MODELS_CACHE_LOCK:
+        hit = _MODELS_CACHE.get(key)
+        if hit and now - hit[0] < (_MODELS_CACHE_TTL if hit[1] else _MODELS_FAILURE_TTL):
+            return hit[1]
+    models: tuple[str, ...] = ()
+    try:
+        env = probe_env(home_dir) if home_dir else apply_browser_block(dict(os.environ))
+        res = subprocess.run(
+            [resolve_agy_command(), "models"], env=env, capture_output=True, text=True, timeout=timeout,
+        )
+        models = tuple(dict.fromkeys(  # agy's own order, deduplicated
+            line.split()[0] for line in (res.stdout or "").splitlines()
+            if line.strip() and "fetching" not in line.lower()
+        ))
+    except Exception as exc:
+        logger.debug("agy models probe failed for %s: %s", home_dir or "host default", exc)
+    with _MODELS_CACHE_LOCK:  # empty = unknown; callers fail open on it
+        _MODELS_CACHE[key] = (now, models)
+    return models
+
+
+def account_supports_model(acc: dict[str, Any], model: str | None) -> bool:
+    """Whether the account lists ``model`` (exact id or an effort variant). Unknown: True."""
+    if not model:
+        return True
+    # Runs on the request path: bound the probe tighter than the picker's listing.
+    models = list_models_for_home(acc.get("home_dir") or None, timeout=8.0)
+    if not models:
+        return True  # probe failed: fail open rather than strand the request
+    m = model.lower()
+    return any(x.lower() == m or x.lower().startswith(m + "-") for x in models)
+
+
 def pick_account(
     model: str | None = None,
     exclude_labels: set[str] | list[str] | None = None,
@@ -906,6 +957,13 @@ def pick_account(
         }
 
         excluded = set(exclude_labels or [])
+        # An account without the model makes agy exit on --model (BrokenPipe, then
+        # fallback provider). Skip it; with none left the request goes to the host
+        # default account, which may have the model.
+        excluded.update(
+            str(acc.get("label", "") or "") for acc in accounts
+            if not account_supports_model(acc, model)
+        )
         if session_id and not _is_session_stickiness_enabled():
             session_id = None  # stickiness disabled for this call
 
