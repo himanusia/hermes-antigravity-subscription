@@ -366,6 +366,50 @@ def update_last_used(label: str) -> None:
         save_accounts(data)
 
 
+SERVING_KEY = "serving"
+# Each request records the account it runs on; skip rewriting the registry when
+# nothing changed and the record is still fresh.
+_SERVING_REFRESH_SECONDS = 60.0
+_SERVING_LOCK = threading.Lock()
+_LAST_SERVING: tuple[str, str | None, float] | None = None
+
+
+def record_serving_account(label: str | None, model: str | None = None) -> None:
+    """Persist which account serves Antigravity requests right now.
+
+    ``label`` is a registered account, or None/"" for the host default account
+    (the real HOME login). Quota views (the TUI quota dock's probe, `/usage`) read
+    it to meter the account actually in use instead of always the host default.
+    Best-effort: a failed write never affects the request.
+    """
+    global _LAST_SERVING
+    norm = (label or "").strip()
+    now = time.time()
+    with _SERVING_LOCK:
+        last = _LAST_SERVING
+        if last and last[0] == norm and last[1] == model and now - last[2] < _SERVING_REFRESH_SECONDS:
+            return
+        _LAST_SERVING = (norm, model, now)
+    try:
+        data = load_accounts()
+        data[SERVING_KEY] = {"label": norm, "model": model, "at": now}
+        save_accounts(data)
+    except Exception as exc:
+        logger.debug("record_serving_account failed: %s", exc)
+
+
+def get_serving_account() -> dict[str, Any] | None:
+    """The registry account last recorded as serving, or None for the host default."""
+    try:
+        data = load_accounts()
+    except Exception:
+        return None
+    label = str((data.get(SERVING_KEY) or {}).get("label") or "")
+    if not label:
+        return None
+    return next((a for a in data.get("accounts", []) if a.get("label") == label), None)
+
+
 def parse_reset_time(reset_time_str: str | None) -> float | None:
     """Parse ISO 8601 reset_time string to Unix epoch timestamp."""
     if not reset_time_str or not isinstance(reset_time_str, str):

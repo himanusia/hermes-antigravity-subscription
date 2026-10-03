@@ -63,6 +63,7 @@ try:
         has_registered_accounts,
         pick_account,
         set_cooldown,
+        record_serving_account,
         update_last_used,
     )
 except ImportError:
@@ -107,6 +108,7 @@ except ImportError:
         has_registered_accounts,
         pick_account,
         set_cooldown,
+        record_serving_account,
         update_last_used,
     )
 
@@ -840,6 +842,9 @@ class AntigravityClient:
             self._current_account_gemini_dir = Path(home_dir) / ".gemini" / "antigravity-cli"
         else:
             self._current_account_gemini_dir = None
+        # Every route (rotation, host default, quota failover) runs through here, so this
+        # is the one place that knows which account actually serves the request.
+        record_serving_account(account_label, model=resolved_model)
 
         worker_acquired = self._worker_lock.acquire(blocking=False)
         if worker_acquired:

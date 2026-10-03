@@ -821,3 +821,19 @@ class HardeningTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ServingAccountTests(unittest.TestCase):
+    def test_record_serving_account_round_trip_and_skips_unchanged_rewrites(self):
+        import accounts
+
+        add_account("work", "/path/work")
+        accounts._LAST_SERVING = None
+        with patch.object(accounts, "save_accounts", wraps=accounts.save_accounts) as save:
+            accounts.record_serving_account("work", model="m")
+            accounts.record_serving_account("work", model="m")
+            self.assertEqual(save.call_count, 1)
+            self.assertEqual(accounts.get_serving_account()["label"], "work")
+            accounts.record_serving_account(None, model="m")
+            self.assertEqual(save.call_count, 2)
+            self.assertIsNone(accounts.get_serving_account())
