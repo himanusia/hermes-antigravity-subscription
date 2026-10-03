@@ -50,6 +50,16 @@ try:
         _render_message_content,
     )
     from .stream import AntigravityStream, collect_stream_completion
+    from .accounts import (
+        fetch_usage_for_home,
+        get_rotation_mode,
+        is_quota_error,
+        lease_account,
+        parse_reset_time,
+        pick_account,
+        set_cooldown,
+        update_last_used,
+    )
 except ImportError:
     from models import (
         _FALLBACK_MODELS,
@@ -79,6 +89,16 @@ except ImportError:
         _render_message_content,
     )
     from stream import AntigravityStream, collect_stream_completion
+    from accounts import (
+        fetch_usage_for_home,
+        get_rotation_mode,
+        is_quota_error,
+        lease_account,
+        parse_reset_time,
+        pick_account,
+        set_cooldown,
+        update_last_used,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -207,6 +227,155 @@ def _force_rmtree(path: str) -> None:
     shutil.rmtree(path, ignore_errors=True)
 
 
+def _resolve_cooldown_reset(account: dict[str, Any], model: str | None) -> float:
+    home_dir = account.get("home_dir", "")
+    m_lower = (model or "").lower()
+    group_key = "claude_gpt" if ("claude" in m_lower or "gpt" in m_lower) else "gemini"
+    usage = fetch_usage_for_home(home_dir, cached=False)
+    if usage and group_key in usage:
+        reset_str = usage[group_key].get("5h", {}).get("reset_time")
+        reset_ts = parse_reset_time(reset_str)
+        if reset_ts and reset_ts > time.time():
+            return reset_ts
+    return time.time() + 900.0
+
+
+def _format_account_usage(account: dict[str, Any] | None, model: str | None) -> str:
+    if not account:
+        return "none (0%)"
+    label = account.get("label", "unknown")
+    home_dir = account.get("home_dir", "")
+    m_lower = (model or "").lower()
+    group_key = "claude_gpt" if ("claude" in m_lower or "gpt" in m_lower) else "gemini"
+    group_label = "claude" if group_key == "claude_gpt" else "gemini"
+    usage = fetch_usage_for_home(home_dir, cached=True)
+    pct = 0
+    if usage and group_key in usage:
+        f_5h = usage[group_key].get("5h", {}).get("remaining_fraction")
+        if f_5h is not None:
+            pct = int(f_5h * 100)
+    return f"{label} ({group_label} 5h {pct}%)"
+
+
+def _log_rotation_failover(
+    prev_account: dict[str, Any],
+    next_account: dict[str, Any] | None,
+    model: str | None,
+) -> None:
+    prev_fmt = _format_account_usage(prev_account, model)
+    prev_part = prev_fmt.replace(" (", " exhausted (", 1)
+    next_part = _format_account_usage(next_account, model)
+    logger.warning("[agy-rotate] %s -> %s", prev_part, next_part)
+
+
+class _RotatingStreamWrapper:
+    """Stream wrapper with turn 1 failover for quota exhaustion across accounts."""
+
+    def __init__(
+        self,
+        client: Any,
+        resolved_model: str,
+        effort: str | None,
+        messages_list: list[dict[str, Any]],
+        effective_timeout: float,
+        tools: list[dict[str, Any]] | None,
+        tool_choice: Any,
+        initial_account: dict[str, Any],
+        initial_stream: Any,
+        tried_labels: set[str],
+        max_attempts: int = 3,
+    ) -> None:
+        self.client = client
+        self.resolved_model = resolved_model
+        self.effort = effort
+        self.messages_list = messages_list
+        self.effective_timeout = effective_timeout
+        self.tools = tools
+        self.tool_choice = tool_choice
+        self.current_account = initial_account
+        self.current_stream = iter(initial_stream)
+        self.tried_labels = set(tried_labels)
+        self.max_attempts = max_attempts
+        self.chunks_yielded = 0
+
+    def _failover(self, exc: Exception) -> bool:
+        if self.chunks_yielded > 0 or not is_quota_error(exc) or len(self.tried_labels) >= self.max_attempts:
+            return False
+
+        with contextlib.suppress(Exception):
+            self.current_stream.close()
+
+        cooldown_ts = _resolve_cooldown_reset(self.current_account, self.resolved_model)
+        set_cooldown(self.current_account["label"], until=cooldown_ts)
+
+        next_acc = pick_account(model=self.resolved_model, exclude_labels=self.tried_labels)
+        _log_rotation_failover(self.current_account, next_acc, self.resolved_model)
+        if not next_acc:
+            return False
+
+        self.tried_labels.add(next_acc["label"])
+        self.current_account = next_acc
+        self.current_stream = iter(
+            self.client._execute_chat_completion(
+                resolved_model=self.resolved_model,
+                effort=self.effort,
+                messages_list=self.messages_list,
+                effective_timeout=self.effective_timeout,
+                tools=self.tools,
+                tool_choice=self.tool_choice,
+                stream=True,
+                home_dir=next_acc["home_dir"],
+                account_label=next_acc["label"],
+            )
+        )
+        return True
+
+    def __iter__(self) -> Any:
+        return self
+
+    def __next__(self) -> Any:
+        while True:
+            try:
+                chunk = next(self.current_stream)
+                self.chunks_yielded += 1
+                return chunk
+            except StopIteration:
+                raise
+            except Exception as exc:
+                if self._failover(exc):
+                    continue
+                raise
+
+    def __aiter__(self) -> Any:
+        return self
+
+    async def __anext__(self) -> Any:
+        while True:
+            try:
+                chunk = await self.current_stream.__anext__()
+                self.chunks_yielded += 1
+                return chunk
+            except StopAsyncIteration:
+                raise
+            except Exception as exc:
+                if self._failover(exc):
+                    continue
+                raise
+
+    def __await__(self) -> Any:
+        try:
+            from .stream import _ready
+        except ImportError:
+            from stream import _ready
+        return _ready(self).__await__()
+
+    def close(self) -> None:
+        self.current_stream.close()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.current_stream, name)
+
+
 class AntigravityClient:
     """OpenAI-compatible client facade driving Antigravity CLI.
 
@@ -295,6 +464,9 @@ class AntigravityClient:
         self._worker_model: str | None = None
         self._worker_effort: str | None = None
         self._worker_history: list[dict[str, Any]] = []
+        self._worker_home_dir: Path | str | None = None
+        self._worker_account_label: str | None = None
+        self._current_account_gemini_dir: Path | None = None
         # Cumulative usage snapshot of the current worker session. agy 1.2.10+
         # persistent workers report cumulative session usage, so per-turn
         # deltas need this baseline. The reference is replaced on every spawn
@@ -316,8 +488,9 @@ class AntigravityClient:
     ) -> tuple[str, str | None]:
         return resolve_model_and_effort(model, reasoning_effort)
 
-    def _child_env(self) -> dict[str, str]:
-        return build_child_env(self._isolated_home)
+    def _child_env(self, home_dir: Path | str | None = None) -> dict[str, str]:
+        target_home = home_dir if home_dir is not None else self._isolated_home
+        return build_child_env(target_home)
 
     @staticmethod
     def _terminate_process(proc: subprocess.Popen) -> None:
@@ -433,6 +606,8 @@ class AntigravityClient:
             self._worker_model = None
             self._worker_effort = None
             self._worker_history = []
+            self._worker_home_dir = None
+            self._worker_account_label = None
             self._active_processes.discard(proc)
             self._terminate_process(proc)
         # The session is gone: any later usage from it belongs to a dead
@@ -447,13 +622,21 @@ class AntigravityClient:
         with self._lock:
             self._worker_history = list(messages or [])
 
-    def _get_or_spawn_worker(self, model: str, effort: str | None) -> subprocess.Popen:
+    def _get_or_spawn_worker(
+        self,
+        model: str,
+        effort: str | None,
+        home_dir: Path | str | None = None,
+        account_label: str | None = None,
+    ) -> subprocess.Popen:
         with self._lock:
             if (
                 self._worker_proc is not None
                 and self._worker_proc.poll() is None
                 and self._worker_model == model
                 and self._worker_effort == effort
+                and self._worker_home_dir == home_dir
+                and self._worker_account_label == account_label
             ):
                 return self._worker_proc
 
@@ -475,12 +658,14 @@ class AntigravityClient:
                 errors="replace",
                 bufsize=1,
                 cwd=self._cwd,
-                env=self._child_env(),
+                env=self._child_env(home_dir),
                 **_own_process_group(),
             )
             self._worker_proc = proc
             self._worker_model = model
             self._worker_effort = effort
+            self._worker_home_dir = home_dir
+            self._worker_account_label = account_label
             self._worker_history = []
             self._worker_usage_baseline = {}
             self._active_processes.add(proc)
@@ -496,6 +681,7 @@ class AntigravityClient:
         tools: list[dict[str, Any]] | None,
         tool_choice: Any,
         stream: bool,
+        home_dir: Path | str | None = None,
     ) -> Any:
         prompt_text = _format_messages_as_prompt(
             messages, model=model, tools=tools, tool_choice=tool_choice
@@ -516,7 +702,7 @@ class AntigravityClient:
             errors="replace",
             bufsize=1,
             cwd=self._cwd,
-            env=self._child_env(),
+            env=self._child_env(home_dir),
             **_own_process_group(),
         )
 
@@ -543,40 +729,30 @@ class AntigravityClient:
             return stream_iter
         return collect_stream_completion(stream_iter)
 
-    def _create_chat_completion(
+    def _execute_chat_completion(
         self,
         *,
-        model: str | None = None,
-        messages: list[dict[str, Any]] | None = None,
-        timeout: float | None = None,
-        tools: list[dict[str, Any]] | None = None,
-        tool_choice: Any = None,
-        stream: bool = False,
-        reasoning_effort: str | None = None,
-        **extra_kwargs: Any,
+        resolved_model: str,
+        effort: str | None,
+        messages_list: list[dict[str, Any]],
+        effective_timeout: float,
+        tools: list[dict[str, Any]] | None,
+        tool_choice: Any,
+        stream: bool,
+        home_dir: Path | str | None = None,
+        account_label: str | None = None,
     ) -> Any:
-        if self.is_closed:
-            raise RuntimeError("AntigravityClient is closed.")
-
-        if not is_authenticated():
-            raise RuntimeError(
-                "Antigravity CLI is not authenticated. Please run 'agy' in your terminal "
-                "to log in with your Google account."
-            )
-
-        effort_param = reasoning_effort or extra_kwargs.get("reasoning_effort")
-        resolved_model, effort = self._resolve_model_and_effort(model, effort_param)
-        messages_list = list(messages or [])
-        effective_timeout = (
-            float(timeout)
-            if isinstance(timeout, (int, float)) and timeout > 0
-            else _DEFAULT_TIMEOUT_SECONDS
-        )
+        if home_dir:
+            self._current_account_gemini_dir = Path(home_dir) / ".gemini" / "antigravity-cli"
+        else:
+            self._current_account_gemini_dir = None
 
         worker_acquired = self._worker_lock.acquire(blocking=False)
         if worker_acquired:
             try:
-                proc = self._get_or_spawn_worker(resolved_model, effort)
+                proc = self._get_or_spawn_worker(
+                    resolved_model, effort, home_dir=home_dir, account_label=account_label
+                )
                 with self._lock:
                     is_continuation = _messages_match_prefix(self._worker_history, messages_list)
 
@@ -586,24 +762,30 @@ class AntigravityClient:
                 else:
                     if self._worker_history:
                         self._terminate_worker()
-                        proc = self._get_or_spawn_worker(resolved_model, effort)
+                        proc = self._get_or_spawn_worker(
+                            resolved_model, effort, home_dir=home_dir, account_label=account_label
+                        )
                     prompt_payload = _format_messages_as_prompt(
                         messages_list, model=resolved_model, tools=tools, tool_choice=tool_choice
                     )
 
                 event_msg = {"event": "user", "message": {"content": prompt_payload}}
                 try:
-                    proc.stdin.write(json.dumps(event_msg) + "\n")
-                    proc.stdin.flush()
+                    if proc.stdin:
+                        proc.stdin.write(json.dumps(event_msg) + "\n")
+                        proc.stdin.flush()
                 except (BrokenPipeError, OSError):
                     self._terminate_worker()
-                    proc = self._get_or_spawn_worker(resolved_model, effort)
+                    proc = self._get_or_spawn_worker(
+                        resolved_model, effort, home_dir=home_dir, account_label=account_label
+                    )
                     prompt_payload = _format_messages_as_prompt(
                         messages_list, model=resolved_model, tools=tools, tool_choice=tool_choice
                     )
                     event_msg = {"event": "user", "message": {"content": prompt_payload}}
-                    proc.stdin.write(json.dumps(event_msg) + "\n")
-                    proc.stdin.flush()
+                    if proc.stdin:
+                        proc.stdin.write(json.dumps(event_msg) + "\n")
+                        proc.stdin.flush()
 
                 with self._lock:
                     worker_usage_baseline = self._worker_usage_baseline
@@ -640,4 +822,130 @@ class AntigravityClient:
                 tools=tools,
                 tool_choice=tool_choice,
                 stream=stream,
+                home_dir=home_dir,
             )
+
+    def _create_chat_completion(
+        self,
+        *,
+        model: str | None = None,
+        messages: list[dict[str, Any]] | None = None,
+        timeout: float | None = None,
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: Any = None,
+        stream: bool = False,
+        reasoning_effort: str | None = None,
+        **extra_kwargs: Any,
+    ) -> Any:
+        if self.is_closed:
+            raise RuntimeError("AntigravityClient is closed.")
+
+        if not is_authenticated():
+            raise RuntimeError(
+                "Antigravity CLI is not authenticated. Please run 'agy' in your terminal "
+                "to log in with your Google account."
+            )
+
+        effort_param = reasoning_effort or extra_kwargs.get("reasoning_effort")
+        resolved_model, effort = self._resolve_model_and_effort(model, effort_param)
+        messages_list = list(messages or [])
+        effective_timeout = (
+            float(timeout)
+            if isinstance(timeout, (int, float)) and timeout > 0
+            else _DEFAULT_TIMEOUT_SECONDS
+        )
+
+        rotation_mode = get_rotation_mode()
+        if rotation_mode == "off":
+            return self._execute_chat_completion(
+                resolved_model=resolved_model,
+                effort=effort,
+                messages_list=messages_list,
+                effective_timeout=effective_timeout,
+                tools=tools,
+                tool_choice=tool_choice,
+                stream=stream,
+            )
+
+        max_attempts = 3
+        tried_labels: set[str] = set()
+        last_exc: Exception | None = None
+
+        for attempt in range(max_attempts):
+            account = pick_account(model=resolved_model, exclude_labels=tried_labels)
+            if not account:
+                if not tried_labels:
+                    # Fail-open: no accounts configured or registry error
+                    return self._execute_chat_completion(
+                        resolved_model=resolved_model,
+                        effort=effort,
+                        messages_list=messages_list,
+                        effective_timeout=effective_timeout,
+                        tools=tools,
+                        tool_choice=tool_choice,
+                        stream=stream,
+                    )
+                if last_exc:
+                    raise last_exc
+                raise RuntimeError("All eligible Antigravity accounts exhausted.")
+
+            label = account["label"]
+            home_dir = account["home_dir"]
+            tried_labels.add(label)
+
+            if stream:
+                with lease_account(label):
+                    raw_stream = self._execute_chat_completion(
+                        resolved_model=resolved_model,
+                        effort=effort,
+                        messages_list=messages_list,
+                        effective_timeout=effective_timeout,
+                        tools=tools,
+                        tool_choice=tool_choice,
+                        stream=True,
+                        home_dir=home_dir,
+                        account_label=label,
+                    )
+                    wrapper = _RotatingStreamWrapper(
+                        client=self,
+                        resolved_model=resolved_model,
+                        effort=effort,
+                        messages_list=messages_list,
+                        effective_timeout=effective_timeout,
+                        tools=tools,
+                        tool_choice=tool_choice,
+                        initial_account=account,
+                        initial_stream=raw_stream,
+                        tried_labels=tried_labels,
+                        max_attempts=max_attempts,
+                    )
+                    update_last_used(label)
+                    return wrapper
+
+            try:
+                with lease_account(label):
+                    res = self._execute_chat_completion(
+                        resolved_model=resolved_model,
+                        effort=effort,
+                        messages_list=messages_list,
+                        effective_timeout=effective_timeout,
+                        tools=tools,
+                        tool_choice=tool_choice,
+                        stream=False,
+                        home_dir=home_dir,
+                        account_label=label,
+                    )
+                    update_last_used(label)
+                    return res
+            except Exception as exc:
+                if is_quota_error(exc):
+                    last_exc = exc
+                    cooldown_ts = _resolve_cooldown_reset(account, resolved_model)
+                    set_cooldown(label, until=cooldown_ts)
+                    next_acc = pick_account(model=resolved_model, exclude_labels=tried_labels)
+                    _log_rotation_failover(account, next_acc, resolved_model)
+                    continue
+                raise
+
+        if last_exc:
+            raise last_exc

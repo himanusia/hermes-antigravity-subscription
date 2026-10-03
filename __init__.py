@@ -221,3 +221,21 @@ antigravity_profile = AntigravitySubscriptionDirectSDKProfile(
 )
 
 register_provider(antigravity_profile)
+
+
+def register(ctx: Any) -> None:
+    """Plugin entry point for Hermes Agent discovery.
+
+    Registers CLI subcommands (hermes antigravity ...) if supported by ctx.
+    """
+    if hasattr(ctx, "register_cli_command"):
+        try:
+            from .cli import setup_cli
+        except ImportError:
+            from cli import setup_cli
+        ctx.register_cli_command(
+            name="antigravity",
+            help="Antigravity multi-account login and quota rotation",
+            setup_fn=setup_cli,
+            description="Manage multiple Google Antigravity accounts and quota rotation.",
+        )
