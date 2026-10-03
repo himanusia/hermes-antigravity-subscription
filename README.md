@@ -136,6 +136,9 @@ Models that ignore the protocol attempt `agy`'s native `RunCommand`/`WriteToFile
 | `ANTIGRAVITY_COMMAND` | `agy` | Path to the `agy` binary. Also checks `AGY_CLI_PATH` and `ANTIGRAVITY_CLI_PATH`. |
 | `ANTIGRAVITY_ARGS` | (none) | Extra arguments to pass to the `agy` subprocess. |
 | `ANTIGRAVITY_CONFIG_DIR` | (none) | Override the config directory, bypassing keyring and token-file detection. |
+| `ANTIGRAVITY_ROTATION` | `off` | Multi-account rotation mode: `off` (default), `quota`, or `round_robin`. |
+| `ANTIGRAVITY_ACCOUNTS_DIR` | `~/.agy-accounts` | Base directory for multi-account isolated HOME environments. |
+| `ANTIGRAVITY_ACCOUNTS_FILE` | `~/.hermes/antigravity-accounts.json` | Path to the multi-account registry file. |
 
 ---
 
@@ -194,9 +197,52 @@ agent:
 
 The provider profile implements `fetch_account_usage()`, exposing subscription quota limits to Hermes `/usage`, the TUI status bar, and the desktop app via `AccountUsageSnapshot`.
 
-Note: Custom plugin tools and slash commands are not available for `kind: model-provider` plugins because Hermes core skips calling `register(ctx)` for model providers (`hermes_cli/plugins_discovery.py:286`, `hermes_cli/plugin_validate.py:253-258`). All quota visibility is provided through the native `fetch_account_usage()` interface.
+Note: Custom plugin tools and slash commands are not available for `kind: model-provider` plugins because Hermes core skips calling `register(ctx)` for model providers (`hermes_cli/plugins_discovery.py:286`, `hermes_cli/plugin_validate.py:253-258`). All quota visibility is provided through the native `fetch_account_usage()` interface. The **companion plugin** (`antigravity-companion`, `kind: standalone`) provides the `hermes antigravity ...` CLI instead.
 
 Quota queries execute `agy -p "/usage" --output-format json` under an isolated HOME environment without consuming any model tokens or inference turns. Results are cached thread-safely for 60 seconds.
+
+### Multi-Account & Quota Rotation
+
+When you have multiple Google accounts with Antigravity / Gemini subscriptions, you can register them and rotate between them automatically.
+
+```bash
+# Add an account (label is optional; if omitted, defaults to the account email from id_token)
+hermes auth add antigravity-subscription-directsdk
+
+# Or specify an explicit label
+hermes auth add antigravity-subscription-directsdk --label work
+
+# Check status and remaining quotas across accounts (includes host default account)
+hermes auth status antigravity-subscription-directsdk
+
+# Refresh quota and clear cooldowns
+hermes auth refresh antigravity-subscription-directsdk
+
+# Remove an account from registry (preserves credentials and directory)
+hermes auth logout antigravity-subscription-directsdk work
+```
+
+#### Account Setup & Authentication
+
+- **Optional Label & Safe Directory Names**: `--label` is optional. When omitted, the plugin extracts the email address directly from the JWT `id_token` payload in the newly saved token file. The home directory name is sanitized for cross-platform compatibility (`[A-Za-z0-9._-]`), while the saved label retains the full email address.
+- **Token File-based Authentication**: Success is determined by the presence of the OAuth token file (`antigravity-oauth-token` or `jetski-standalone-oauth-token`), rather than the process exit code.
+- **macOS Keychain Dialog**: On macOS, a system dialog may prompt: *"a keychain cannot be found to store 'antigravity'"*. You can safely click **Cancel**. Account credentials are stored securely in isolated token files and do not affect the host keychain.
+- **Automatic Eligibility Check**: Upon sign-in, the plugin validates subscription eligibility via `agy -p /usage --output-format json`. Ineligible accounts are saved with `eligible: false` and are automatically bypassed during quota rotation.
+
+#### Rotation Modes
+
+Set per session with `ANTIGRAVITY_ROTATION`, or persistently in the registry with `hermes antigravity mode <mode>` (the env var wins for the session):
+
+- `off` (default): always use the host default account or the single active account.
+- `quota`: pick the healthiest account per request with base score `f_5h * f_weekly^2`, scaled by replenishment urgency (a window about to reset ranks higher) and divided by `(1 + active leases)`. Ineligible accounts and accounts at 0% in either the 5-hour or weekly window are hard-gated (score = 0.0).
+- `round_robin`: cycle through available, eligible accounts sequentially.
+- `fixed`: always use the pinned account, set with `hermes antigravity use <label>` or `ANTIGRAVITY_ACCOUNT=<label>` for one session. Fails open to the host default when the pinned account is unavailable.
+
+Session stickiness keeps one account per Hermes session so the prompt prefix cache stays warm (`ANTIGRAVITY_SESSION_STICKINESS=0` disables it). Quota ignition (`hermes antigravity ignite on`) optionally wakes an idle 5-hour window on the selected account.
+
+If an account encounters a quota or rate limit error (HTTP 429 / resource exhausted), it is placed on a cooldown and Hermes automatically fails over to the next best available account.
+
+Account credentials are stored under `~/.agy-accounts/<label>/` and the registry file is stored at `~/.hermes/antigravity-accounts.json` (configurable via `ANTIGRAVITY_ACCOUNTS_DIR` and `ANTIGRAVITY_ACCOUNTS_FILE`).
 
 ---
 
