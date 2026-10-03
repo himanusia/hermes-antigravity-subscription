@@ -192,12 +192,9 @@ agent:
 
 ### Subscription Quota & Usage Tracking
 
-Track your Antigravity subscription limits across 4 interfaces:
+The provider profile implements `fetch_account_usage()`, exposing subscription quota limits to Hermes `/usage`, the TUI status bar, and the desktop app via `AccountUsageSnapshot`.
 
-1. **Hermes `/usage`, Status Bar, and Desktop**: The provider profile implements `fetch_account_usage()`, automatically integrating with Hermes' native account limits display, TUI status bar, and desktop app.
-2. **In-session Slash Command**: Run `/agy-usage` (or `/agy-usage --refresh` to bypass cache) in an active Hermes session.
-3. **Agent Tool**: The `antigravity_usage` tool enables autonomous agents to monitor their remaining quota.
-4. **CLI Subcommand**: Run `hermes agy-usage [--refresh] [--json]` from the command line.
+Note: Custom plugin tools and slash commands are not available for `kind: model-provider` plugins because Hermes core skips calling `register(ctx)` for model providers (`hermes_cli/plugins_discovery.py:286`, `hermes_cli/plugin_validate.py:253-258`). All quota visibility is provided through the native `fetch_account_usage()` interface.
 
 Quota queries execute `agy -p "/usage" --output-format json` under an isolated HOME environment without consuming any model tokens or inference turns. Results are cached thread-safely for 60 seconds.
 

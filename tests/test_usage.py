@@ -13,7 +13,6 @@ if str(plugin_dir) not in sys.path:
     sys.path.insert(0, str(plugin_dir))
 
 from usage import (
-    ANTIGRAVITY_USAGE_TOOL_SCHEMA,
     SubscriptionUsage,
     UsageBucket,
     UsageGroup,
@@ -24,12 +23,8 @@ from usage import (
     format_countdown,
     format_reset_time,
     get_account_usage_snapshot,
-    handle_agy_usage_cli,
-    handle_agy_usage_slash_command,
-    handle_antigravity_usage_tool,
     parse_agy_usage,
     render_usage_text,
-    setup_agy_usage_cli,
     to_account_usage_snapshot,
 )
 import __init__ as plugin_module
@@ -304,38 +299,6 @@ class TestCachingAndQuery(unittest.TestCase):
         self.assertIsNone(res)
 
 
-class TestToolAndSlashCommands(unittest.TestCase):
-    @patch("usage.fetch_subscription_usage")
-    def test_handle_antigravity_usage_tool(self, mock_fetch):
-        mock_fetch.return_value = parse_agy_usage(SAMPLE_AGY_USAGE_JSON)
-        res = handle_antigravity_usage_tool({"force_refresh": True})
-        self.assertIn("Gemini Models:", res)
-        mock_fetch.assert_called_with(force_refresh=True)
-
-    @patch("usage.fetch_subscription_usage", return_value=None)
-    def test_handle_antigravity_usage_tool_failure(self, mock_fetch):
-        res = handle_antigravity_usage_tool()
-        self.assertIn("Unable to fetch Antigravity subscription quota", res)
-
-    @patch("usage.fetch_subscription_usage")
-    def test_handle_agy_usage_slash_command(self, mock_fetch):
-        mock_fetch.return_value = parse_agy_usage(SAMPLE_AGY_USAGE_JSON)
-        res = handle_agy_usage_slash_command("--refresh")
-        self.assertIn("Claude and GPT models:", res)
-        mock_fetch.assert_called_with(force_refresh=True)
-
-    @patch("usage.fetch_subscription_usage")
-    def test_handle_agy_usage_cli(self, mock_fetch):
-        sample = parse_agy_usage(SAMPLE_AGY_USAGE_JSON)
-        mock_fetch.return_value = sample
-
-        args_text = MagicMock(refresh=False, json=False)
-        self.assertEqual(handle_agy_usage_cli(args_text), 0)
-
-        args_json = MagicMock(refresh=True, json=True)
-        self.assertEqual(handle_agy_usage_cli(args_json), 0)
-
-
 class TestProviderIntegration(unittest.TestCase):
     @patch("usage.fetch_subscription_usage")
     def test_provider_profile_fetch_account_usage(self, mock_fetch):
@@ -346,28 +309,24 @@ class TestProviderIntegration(unittest.TestCase):
         self.assertEqual(snapshot.provider, "antigravity-subscription-directsdk")
         self.assertEqual(len(snapshot.windows), 4)
 
-    def test_register_ctx(self):
-        ctx = MagicMock()
-        plugin_module.register(ctx)
-        ctx.register_tool.assert_called_once()
-        ctx.register_command.assert_called_once()
-        ctx.register_cli_command.assert_called_once()
-
-        tool_kwargs = ctx.register_tool.call_args[1]
-        self.assertEqual(tool_kwargs["name"], "antigravity_usage")
-        self.assertEqual(tool_kwargs["schema"], ANTIGRAVITY_USAGE_TOOL_SCHEMA)
-
-        cmd_args = ctx.register_command.call_args[0]
-        self.assertEqual(cmd_args[0], "agy-usage")
-
-        cli_kwargs = ctx.register_cli_command.call_args[1]
-        self.assertEqual(cli_kwargs["name"], "agy-usage")
-
-    def test_register_ctx_minimal_noop(self):
-        # Objects without register_tool / register_command do not raise
-        class MinimalCtx:
-            pass
-        plugin_module.register(MinimalCtx())
+    @patch("usage._query_agy_usage")
+    def test_provider_profile_fetch_account_usage_returns_four_windows_from_fixture(self, mock_query):
+        mock_query.return_value = parse_agy_usage(SAMPLE_AGY_USAGE_JSON)
+        profile = plugin_module.antigravity_profile
+        snapshot = profile.fetch_account_usage(force_refresh=True)
+        self.assertIsNotNone(snapshot)
+        self.assertEqual(snapshot.provider, "antigravity-subscription-directsdk")
+        self.assertEqual(len(snapshot.windows), 4)
+        expected_labels = [
+            "Gemini (Weekly)",
+            "Gemini (5h)",
+            "Claude/GPT (Weekly)",
+            "Claude/GPT (5h)",
+        ]
+        self.assertEqual([w.label for w in snapshot.windows], expected_labels)
+        for w in snapshot.windows:
+            self.assertIsNotNone(w.used_percent)
+            self.assertIsNotNone(w.reset_at)
 
 
 if __name__ == "__main__":

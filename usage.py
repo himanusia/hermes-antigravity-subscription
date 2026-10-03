@@ -4,15 +4,12 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import subprocess
-import sys
 import tempfile
 import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
 
 if TYPE_CHECKING:
@@ -395,87 +392,3 @@ def render_usage_text(usage: SubscriptionUsage) -> str:
 
     return "\n".join(lines)
 
-
-ANTIGRAVITY_USAGE_TOOL_SCHEMA: dict[str, Any] = {
-    "name": "antigravity_usage",
-    "description": (
-        "Check current Google Antigravity / Gemini subscription quota and limits "
-        "for Gemini and Claude/GPT models, including remaining percentages, reset times, "
-        "and countdowns."
-    ),
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "force_refresh": {
-                "type": "boolean",
-                "description": (
-                    "If true, bypass the local cache and query agy directly for fresh "
-                    "quota data. Default false."
-                ),
-                "default": False,
-            }
-        },
-        "required": [],
-    },
-}
-
-
-def handle_antigravity_usage_tool(args: dict[str, Any] | None = None, **kwargs: Any) -> str:
-    """Tool handler for agent tool `antigravity_usage`."""
-    args = args or {}
-    force_refresh = bool(args.get("force_refresh", False))
-    usage = fetch_subscription_usage(force_refresh=force_refresh)
-    if usage is None:
-        return (
-            "Unable to fetch Antigravity subscription quota. "
-            "Ensure the agy CLI is installed, authenticated, and accessible."
-        )
-    return render_usage_text(usage)
-
-
-def handle_agy_usage_slash_command(raw_args: str = "") -> str:
-    """Handler for in-session slash command /agy-usage."""
-    args_lower = (raw_args or "").strip().lower().split()
-    force_refresh = any(
-        arg in ("--refresh", "-r", "--force", "refresh", "force") for arg in args_lower
-    )
-    usage = fetch_subscription_usage(force_refresh=force_refresh)
-    if usage is None:
-        return (
-            "Unable to fetch Antigravity subscription quota. "
-            "Ensure the agy CLI is installed, authenticated, and accessible."
-        )
-    return render_usage_text(usage)
-
-
-def setup_agy_usage_cli(subparser: Any) -> None:
-    """Setup function for CLI subcommand `hermes agy-usage`."""
-    subparser.add_argument(
-        "--refresh",
-        "-r",
-        action="store_true",
-        help="Bypass cache and query agy directly for fresh quota data",
-    )
-    subparser.add_argument(
-        "--json",
-        action="store_true",
-        help="Output raw quota data as JSON",
-    )
-
-
-def handle_agy_usage_cli(args: Any) -> int:
-    """Handler function for CLI subcommand `hermes agy-usage`."""
-    force_refresh = getattr(args, "refresh", False)
-    usage = fetch_subscription_usage(force_refresh=force_refresh)
-    if usage is None:
-        print(
-            "Unable to fetch Antigravity subscription quota. "
-            "Ensure the agy CLI is installed, authenticated, and accessible.",
-            file=sys.stderr,
-        )
-        return 1
-    if getattr(args, "json", False):
-        print(json.dumps(usage.raw, indent=2))
-    else:
-        print(render_usage_text(usage))
-    return 0
