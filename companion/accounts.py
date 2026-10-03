@@ -157,11 +157,30 @@ def resolve_account(label: str) -> dict[str, Any] | None:
     return None
 
 
+# A registered account's HOME has no keychain, so agy's keychain write on token
+# refresh pops macOS's "A keychain cannot be found" dialog before falling back to
+# the token file. With an SSH session detected agy uses the file directly.
+_FILE_TOKEN_STORAGE_ENV = {"SSH_CONNECTION": "127.0.0.1 0 127.0.0.1 0"}
+
+
+def account_env(home: Path | str) -> dict[str, str]:
+    """agy environment for one account: HOME pointed at it, token kept in its file.
+
+    The host account (the real home) keeps the login keychain its token lives in.
+    """
+    env = os.environ.copy()
+    home_path = Path(home).expanduser()
+    env["HOME"] = str(home_path)
+    env.pop("ANTIGRAVITY_CONFIG_DIR", None)
+    if home_path.resolve() != Path.home().resolve():
+        for key, value in _FILE_TOKEN_STORAGE_ENV.items():
+            env.setdefault(key, value)
+    return env
+
+
 def probe(home: Path | str) -> tuple[bool | None, dict[str, float | None], str, dict[str, float]]:
     """(eligible, windows, note, reset_times). eligible is None when it cannot be determined."""
-    env = os.environ.copy()
-    env["HOME"] = str(Path(home).expanduser())
-    env.pop("ANTIGRAVITY_CONFIG_DIR", None)
+    env = account_env(home)
     try:
         result = subprocess.run(
             [agy_command(), "-p", "/usage", "--output-format", "json"],
@@ -208,9 +227,7 @@ def probe(home: Path | str) -> tuple[bool | None, dict[str, float | None], str, 
 
 def run_agy(home: Path | str, args: list[str]) -> int:
     """Run the official agy binary with HOME pointed at one account. Returns its exit code."""
-    env = os.environ.copy()
-    env["HOME"] = str(Path(home).expanduser())
-    env.pop("ANTIGRAVITY_CONFIG_DIR", None)
+    env = account_env(home)
     try:
         return subprocess.call([agy_command(), *args], env=env)
     except FileNotFoundError:

@@ -207,3 +207,11 @@ class CommandTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_account_env_keeps_registered_account_tokens_out_of_the_keychain(tmp_path, monkeypatch):
+    monkeypatch.delenv("SSH_CONNECTION", raising=False)
+    env = accounts.account_env(tmp_path / "work")
+    assert env["HOME"] == str(tmp_path / "work")
+    assert "SSH_CONNECTION" in env  # agy: file token storage, no keychain dialog
+    assert "SSH_CONNECTION" not in accounts.account_env(Path.home())  # host keeps its keychain
