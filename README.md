@@ -240,6 +240,10 @@ Set per session with `ANTIGRAVITY_ROTATION`, or persistently in the registry wit
 
 Session stickiness keeps one account per Hermes session so the prompt prefix cache stays warm (`ANTIGRAVITY_SESSION_STICKINESS=0` disables it). Quota ignition (`hermes antigravity ignite on`) optionally wakes an idle 5-hour window on the selected account.
 
+Model access is per Google account (one account may list Claude 5.5 while another only has 4.6), so rotation only picks accounts whose `agy models` listing has the requested model; with none left the request runs on the host default account.
+
+The account serving requests is recorded in the registry (`serving`), and `/usage` meters that account: the snapshot title ends with the account label (`default` for the host login).
+
 If an account encounters a quota or rate limit error (HTTP 429 / resource exhausted), it is placed on a cooldown and Hermes automatically fails over to the next best available account.
 
 Account credentials are stored under `~/.agy-accounts/<label>/` and the registry file is stored at `~/.hermes/antigravity-accounts.json` (configurable via `ANTIGRAVITY_ACCOUNTS_DIR` and `ANTIGRAVITY_ACCOUNTS_FILE`).

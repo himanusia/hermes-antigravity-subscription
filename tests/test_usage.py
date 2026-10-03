@@ -382,3 +382,52 @@ class TestProviderIntegration(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ServingAccountSnapshotTests(unittest.TestCase):
+    """The quota snapshot meters the account serving requests, not always the host default."""
+
+    def setUp(self):
+        import usage
+        with usage._cache_lock:
+            usage._cached_usage = None
+            usage._cached_timestamp = 0.0
+            usage._account_cache.clear()
+
+    def test_snapshot_follows_the_serving_account(self):
+        import accounts
+        import usage
+
+        accounts.add_account("work", "/path/work")
+        sample = parse_agy_usage(SAMPLE_AGY_USAGE_JSON)
+        homes = []
+
+        def fake_query(timeout=8.0, home_dir=None):
+            homes.append(home_dir)
+            return sample
+
+        with patch.object(usage, "_query_agy_usage", side_effect=fake_query):
+            accounts._LAST_SERVING = None
+            accounts.record_serving_account(None, model="gemini-3.8-flash")
+            snapshot = get_account_usage_snapshot()
+            self.assertEqual(snapshot.title, "Antigravity subscription · default")
+            self.assertIn("Account: default", snapshot.details)
+
+            accounts.record_serving_account("work", model="claude-sonnet-4-6")
+            snapshot = get_account_usage_snapshot()
+            self.assertEqual(snapshot.title, "Antigravity subscription · work")
+            self.assertEqual(accounts.get_serving_account()["label"], "work")
+
+        self.assertEqual(homes[0], None)
+        self.assertTrue(str(homes[1]).endswith("work"))
+
+    def test_record_serving_account_skips_unchanged_rewrites(self):
+        import accounts
+
+        accounts._LAST_SERVING = None
+        with patch.object(accounts, "save_accounts", wraps=accounts.save_accounts) as save:
+            accounts.record_serving_account("a", model="m")
+            accounts.record_serving_account("a", model="m")
+            self.assertEqual(save.call_count, 1)
+            accounts.record_serving_account("b", model="m")
+            self.assertEqual(save.call_count, 2)

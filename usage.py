@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 import subprocess
@@ -246,18 +247,24 @@ def parse_agy_usage(payload: Any) -> SubscriptionUsage | None:
     )
 
 
-def _query_agy_usage(timeout: float = 8.0) -> SubscriptionUsage | None:
-    """Run `agy -p "/usage" --output-format json` under an isolated HOME environment."""
+def _query_agy_usage(timeout: float = 8.0, home_dir: str | None = None) -> SubscriptionUsage | None:
+    """Run `agy -p "/usage" --output-format json` under an isolated HOME environment.
+
+    ``home_dir`` queries a registered rotation account (its own HOME and token)
+    instead of the host default login.
+    """
     cmd = resolve_agy_command()
     tmp_dir = tempfile.mkdtemp(prefix="hermes_agy_usage_")
     try:
-        isolated_home, _ = setup_isolated_home(tmp_dir)
-        env = build_child_env(isolated_home)
         try:  # a quota probe must never open a browser window
-            from .accounts import apply_browser_block
+            from .accounts import apply_browser_block, probe_env
         except ImportError:
-            from accounts import apply_browser_block
-        env = apply_browser_block(env)
+            from accounts import apply_browser_block, probe_env
+        if home_dir:
+            env = probe_env(home_dir)
+        else:
+            isolated_home, _ = setup_isolated_home(tmp_dir)
+            env = apply_browser_block(build_child_env(isolated_home))
         res = subprocess.run(
             [cmd, "-p", "/usage", "--output-format", "json"],
             env=env,
@@ -381,12 +388,50 @@ def to_account_usage_snapshot(usage: SubscriptionUsage) -> AccountUsageSnapshot:
     )
 
 
+_account_cache: dict[str, tuple[float, SubscriptionUsage]] = {}
+
+
+def _fetch_account_subscription_usage(
+    home_dir: str, force_refresh: bool = False, timeout: float = 8.0,
+) -> SubscriptionUsage | None:
+    """Per-account twin of fetch_subscription_usage (same TTL, same stale fallback)."""
+    now = time.time()
+    with _cache_lock:
+        hit = _account_cache.get(home_dir)
+        if not force_refresh and hit and now - hit[0] < USAGE_CACHE_TTL_SECONDS:
+            return hit[1]
+    usage = _query_agy_usage(timeout=timeout, home_dir=home_dir)
+    with _cache_lock:
+        if usage is not None:
+            _account_cache[home_dir] = (time.time(), usage)
+            return usage
+        hit = _account_cache.get(home_dir)
+        return None if force_refresh or not hit else hit[1]
+
+
 def get_account_usage_snapshot(force_refresh: bool = False) -> AccountUsageSnapshot | None:
-    """Official Hermes account usage entrypoint for ProviderProfile.fetch_account_usage."""
-    usage = fetch_subscription_usage(force_refresh=force_refresh)
+    """Official Hermes account usage entrypoint for ProviderProfile.fetch_account_usage.
+
+    Meters the account that is serving requests (recorded by the client), so with
+    rotation the quota shown is the one being spent, not always the host default's.
+    """
+    try:
+        from .accounts import get_serving_account
+    except ImportError:
+        from accounts import get_serving_account
+    account = get_serving_account()
+    if account and account.get("home_dir"):
+        usage = _fetch_account_subscription_usage(account["home_dir"], force_refresh=force_refresh)
+        label = str(account.get("label") or "")
+    else:
+        usage = fetch_subscription_usage(force_refresh=force_refresh)
+        label = "default"
     if usage is None:
         return None
-    return to_account_usage_snapshot(usage)
+    snapshot = to_account_usage_snapshot(usage)
+    return dataclasses.replace(
+        snapshot, title=f"{snapshot.title} · {label}", details=(*snapshot.details, f"Account: {label}"),
+    )
 
 
 def render_usage_text(usage: SubscriptionUsage) -> str:
