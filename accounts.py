@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import base64
 import contextlib
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -132,7 +134,110 @@ def save_accounts(data: dict[str, Any]) -> None:
                     tmp_path.unlink()
 
 
-def add_account(label: str, home_dir: str, enabled: bool = True) -> dict[str, Any]:
+def sanitize_folder_name(name: str) -> str:
+    """Sanitize a label or email for safe filesystem folder naming across OSes."""
+    sanitized = re.sub(r"[^A-Za-z0-9._-]", "-", name.strip())
+    return sanitized or "account"
+
+
+def find_account_token_path(home_dir: str | Path) -> Path | None:
+    """Locate a valid OAuth token file inside an account home directory."""
+    base = Path(home_dir).expanduser().resolve() / ".gemini" / "antigravity-cli"
+    for filename in ("jetski-standalone-oauth-token", "antigravity-oauth-token"):
+        cand = base / filename
+        try:
+            if cand.is_file() and cand.stat().st_size > 0:
+                return cand
+        except OSError:
+            pass
+    return None
+
+
+def extract_email_from_token_file(token_path: str | Path) -> str | None:
+    """Decode JWT id_token payload from token file and extract email.
+
+    Does not log or expose the raw token content.
+    """
+    try:
+        content = Path(token_path).read_text(encoding="utf-8")
+        data = json.loads(content)
+        id_token = data.get("id_token")
+        if not id_token or not isinstance(id_token, str):
+            return None
+        parts = id_token.split(".")
+        if len(parts) < 2:
+            return None
+        payload_b64 = parts[1]
+        padding = "=" * ((4 - len(payload_b64) % 4) % 4)
+        payload_bytes = base64.urlsafe_b64decode(payload_b64 + padding)
+        payload = json.loads(payload_bytes.decode("utf-8"))
+        email = payload.get("email")
+        if email and isinstance(email, str) and email.strip():
+            return email.strip()
+    except Exception as exc:
+        logger.debug("Failed to extract email from token file %s: %s", token_path, exc)
+    return None
+
+
+def check_account_eligibility(
+    home_dir: str | Path,
+    timeout: float = 30.0,
+) -> tuple[bool, dict[str, Any] | None]:
+    """Check account eligibility via `agy -p /usage --output-format json`.
+
+    Returns (is_eligible, parsed_usage_or_None).
+    """
+    norm_home = str(Path(home_dir).expanduser().resolve())
+    try:
+        cmd = resolve_agy_command()
+    except Exception:
+        return False, None
+
+    env = os.environ.copy()
+    env["HOME"] = norm_home
+    env.pop("ANTIGRAVITY_CONFIG_DIR", None)
+
+    try:
+        res = subprocess.run(
+            [cmd, "-p", "/usage", "--output-format", "json"],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+        combined = f"{res.stdout}\n{res.stderr}".lower()
+        if "eligibility check failed" in combined or "not eligible" in combined:
+            return False, None
+        if res.returncode != 0:
+            return False, None
+
+        parsed = _parse_usage_json(res.stdout)
+        if parsed is not None:
+            with _USAGE_CACHE_LOCK:
+                _USAGE_CACHE[norm_home] = (time.monotonic(), parsed)
+            return True, parsed
+
+        try:
+            raw_data = json.loads(res.stdout)
+            if isinstance(raw_data, dict) and raw_data.get("status") == "SUCCESS":
+                return True, None
+        except Exception:
+            pass
+
+        return False, None
+    except Exception as exc:
+        logger.debug("Eligibility check error for %s: %s", norm_home, exc)
+        return False, None
+
+
+def add_account(
+    label: str,
+    home_dir: str,
+    enabled: bool = True,
+    eligible: bool = True,
+    email: str | None = None,
+) -> dict[str, Any]:
     """Add or update an account entry in the registry."""
     norm_label = label.strip()
     norm_home = str(Path(home_dir).expanduser().resolve())
@@ -148,14 +253,20 @@ def add_account(label: str, home_dir: str, enabled: bool = True) -> dict[str, An
     if target is not None:
         target["home_dir"] = norm_home
         target["enabled"] = bool(enabled)
+        target["eligible"] = bool(eligible)
+        if email:
+            target["email"] = email
     else:
         target = {
             "label": norm_label,
             "home_dir": norm_home,
             "enabled": bool(enabled),
+            "eligible": bool(eligible),
             "last_used": 0.0,
             "cooldown_until": 0.0,
         }
+        if email:
+            target["email"] = email
         accounts.append(target)
 
     data["accounts"] = accounts
@@ -372,9 +483,10 @@ def calculate_score(
     f_weekly: float,
     in_cooldown: bool,
     lease_count: int = 0,
+    eligible: bool = True,
 ) -> float:
-    """Calculate account selection score with hard gate at 0% or cooldown."""
-    if in_cooldown or f_5h <= 0.0 or f_weekly <= 0.0:
+    """Calculate account selection score with hard gate at 0%, cooldown, or ineligible."""
+    if not eligible or in_cooldown or f_5h <= 0.0 or f_weekly <= 0.0:
         return 0.0
     raw_score = f_5h * (f_weekly ** 2)
     # Penalty for active leases ensures concurrent turns distribute evenly
@@ -418,7 +530,9 @@ def pick_account(
         excluded = set(exclude_labels or [])
         enabled_accounts = [
             acc for acc in accounts
-            if acc.get("enabled", True) and acc.get("label") not in excluded
+            if acc.get("enabled", True)
+            and acc.get("eligible", True)
+            and acc.get("label") not in excluded
         ]
         if not enabled_accounts:
             return None
@@ -454,6 +568,7 @@ def pick_account(
                 f_weekly=f_weekly,
                 in_cooldown=in_cooldown,
                 lease_count=get_lease_count(acc["label"]),
+                eligible=acc.get("eligible", True),
             )
             if score > 0.0:
                 scored.append((score, acc))

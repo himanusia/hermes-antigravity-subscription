@@ -137,8 +137,8 @@ Models that ignore the protocol attempt `agy`'s native `RunCommand`/`WriteToFile
 | `ANTIGRAVITY_ARGS` | (none) | Extra arguments to pass to the `agy` subprocess. |
 | `ANTIGRAVITY_CONFIG_DIR` | (none) | Override the config directory, bypassing keyring and token-file detection. |
 | `ANTIGRAVITY_ROTATION` | `off` | Multi-account rotation mode: `off` (default), `quota`, or `round_robin`. |
-| `ANTIGRAVITY_ACCOUNTS_DIR` | `~/.hermes/antigravity` | Base directory for multi-account isolated HOME environments. |
-| `ANTIGRAVITY_ACCOUNTS_FILE` | `~/.hermes/antigravity/accounts.json` | Path to the multi-account registry file. |
+| `ANTIGRAVITY_ACCOUNTS_DIR` | `~/.agy-accounts` | Base directory for multi-account isolated HOME environments. |
+| `ANTIGRAVITY_ACCOUNTS_FILE` | `~/.hermes/antigravity-accounts.json` | Path to the multi-account registry file. |
 
 ---
 
@@ -198,15 +198,14 @@ agent:
 When you have multiple Google accounts with Antigravity / Gemini subscriptions, you can register them and rotate between them automatically.
 
 ```bash
-# Add a new account (opens agy in an isolated HOME for browser sign-in)
+# Add an account (label is optional; if omitted, defaults to the account email from id_token)
+hermes auth add antigravity-subscription-directsdk
+
+# Or specify an explicit label
 hermes auth add antigravity-subscription-directsdk --label work
-hermes auth add antigravity-subscription-directsdk --label personal
 
-# Check status and remaining quotas across accounts
+# Check status and remaining quotas across accounts (includes host default account)
 hermes auth status antigravity-subscription-directsdk
-
-# Set manual active account
-hermes auth use antigravity-subscription-directsdk work
 
 # Refresh quota and clear cooldowns
 hermes auth refresh antigravity-subscription-directsdk
@@ -215,17 +214,24 @@ hermes auth refresh antigravity-subscription-directsdk
 hermes auth logout antigravity-subscription-directsdk work
 ```
 
+#### Account Setup & Authentication
+
+- **Optional Label & Safe Directory Names**: `--label` is optional. When omitted, the plugin extracts the email address directly from the JWT `id_token` payload in the newly saved token file. The home directory name is sanitized for cross-platform compatibility (`[A-Za-z0-9._-]`), while the saved label retains the full email address.
+- **Token File-based Authentication**: Success is determined by the presence of the OAuth token file (`antigravity-oauth-token` or `jetski-standalone-oauth-token`), rather than the process exit code.
+- **macOS Keychain Dialog**: On macOS, a system dialog may prompt: *"a keychain cannot be found to store 'antigravity'"*. You can safely click **Cancel**. Account credentials are stored securely in isolated token files and do not affect the host keychain.
+- **Automatic Eligibility Check**: Upon sign-in, the plugin validates subscription eligibility via `agy -p /usage --output-format json`. Ineligible accounts are saved with `eligible: false` and are automatically bypassed during quota rotation.
+
 #### Rotation Modes
 
 Configured via `ANTIGRAVITY_ROTATION` environment variable in your `~/.hermes/config.yaml` or shell environment:
 
-- `off` (default): Always use the single active account or the first registered account.
-- `quota`: Automatically pick the account with the highest score `f_5h * (f_weekly ** 2)` on each request. Accounts with 0% remaining in either the 5-hour or weekly window are hard-gated.
-- `round_robin`: Cycle through registered accounts sequentially.
+- `off` (default): Always use the host default account or the single active account.
+- `quota`: Automatically pick the account with the highest score `f_5h * (f_weekly ** 2)` on each request. Ineligible accounts and accounts with 0% remaining quota in either the 5-hour or weekly window are hard-gated (score = 0.0).
+- `round_robin`: Cycle through available, eligible accounts sequentially.
 
-If an account encounters a quota or rate limit error (HTTP 429 / resource exhausted), it is placed on a 15-minute cooldown (or until the reset time parsed from `agy`) and Hermes automatically fails over to the next best available account.
+If an account encounters a quota or rate limit error (HTTP 429 / resource exhausted), it is placed on a cooldown and Hermes automatically fails over to the next best available account.
 
-Account credentials and the registry are stored under `~/.hermes/antigravity/` (configurable via `ANTIGRAVITY_ACCOUNTS_DIR` and `ANTIGRAVITY_ACCOUNTS_FILE`).
+Account credentials are stored under `~/.agy-accounts/<label>/` and the registry file is stored at `~/.hermes/antigravity-accounts.json` (configurable via `ANTIGRAVITY_ACCOUNTS_DIR` and `ANTIGRAVITY_ACCOUNTS_FILE`).
 
 ---
 

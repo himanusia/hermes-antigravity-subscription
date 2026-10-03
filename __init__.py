@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -15,11 +17,16 @@ try:
     from .accounts import (
         DEFAULT_ACCOUNTS_DIR,
         add_account,
+        check_account_eligibility,
+        extract_email_from_token_file,
         fetch_usage_for_home,
+        find_account_token_path,
         get_accounts_dir,
         get_active,
+        get_rotation_mode,
         list_accounts,
         remove_account,
+        sanitize_folder_name,
         set_active,
         set_cooldown,
     )
@@ -28,11 +35,16 @@ except ImportError:
     from accounts import (
         DEFAULT_ACCOUNTS_DIR,
         add_account,
+        check_account_eligibility,
+        extract_email_from_token_file,
         fetch_usage_for_home,
+        find_account_token_path,
         get_accounts_dir,
         get_active,
+        get_rotation_mode,
         list_accounts,
         remove_account,
+        sanitize_folder_name,
         set_active,
         set_cooldown,
     )
@@ -232,6 +244,20 @@ def _classify_antigravity_error(
     return None
 
 
+def _shorten_home(path_str: str) -> str:
+    """Return ~ relative path if under user home directory."""
+    try:
+        p = Path(path_str).resolve()
+        h = Path.home().resolve()
+        if p == h:
+            return "~"
+        if p.is_relative_to(h):
+            return f"~/{p.relative_to(h)}"
+    except Exception:
+        pass
+    return str(path_str)
+
+
 def antigravity_auth_handler(action: str, args: Any) -> bool:
     """Provider-owned auth handler for `hermes auth add|status|logout|refresh`.
 
@@ -245,67 +271,154 @@ def antigravity_auth_handler(action: str, args: Any) -> bool:
                 "so you can complete the browser-based Google authentication."
             )
 
-        label = (getattr(args, "label", None) or "").strip()
-        if not label:
-            try:
-                label = input("Account label: ").strip()
-            except (EOFError, KeyboardInterrupt):
-                raise SystemExit(1)
-        if not label:
-            raise SystemExit("Error: --label is required and cannot be empty.")
-
+        user_label = (getattr(args, "label", None) or "").strip()
         accounts_dir = get_accounts_dir()
-        home_dir = accounts_dir / label
-        home_dir.mkdir(parents=True, exist_ok=True)
-        try:
-            home_dir.chmod(0o700)
-        except OSError:
-            pass
+        accounts_dir.mkdir(parents=True, exist_ok=True)
+        with contextlib.suppress(OSError):
+            accounts_dir.chmod(0o700)
 
-        # Additional accounts stay fully isolated: no host keychain link. On macOS agy
-        # keeps its session in $HOME/Library/Keychains (service "gemini", account
-        # "antigravity"), so linking the host keychain here would let the new account
-        # reuse or overwrite the existing account credential.
+        is_staging = False
+        if user_label:
+            folder_name = sanitize_folder_name(user_label)
+            home_dir = accounts_dir / folder_name
+        else:
+            folder_name = f".staging_{os.getpid()}_{int(time.time() * 1000)}"
+            home_dir = accounts_dir / folder_name
+            is_staging = True
+
+        home_dir.mkdir(parents=True, exist_ok=True)
+        with contextlib.suppress(OSError):
+            home_dir.chmod(0o700)
 
         try:
             cmd = resolve_agy_command()
         except Exception as exc:
+            if is_staging:
+                shutil.rmtree(home_dir, ignore_errors=True)
             raise SystemExit(f"Error resolving agy CLI: {exc}")
 
         env = os.environ.copy()
         env["HOME"] = str(home_dir)
         env.pop("ANTIGRAVITY_CONFIG_DIR", None)
 
-        print(f"Opening agy in {home_dir} for account '{label}'...")
+        print(f"Opening agy in {home_dir} for Antigravity sign-in...")
         print("Please complete the sign-in prompt in your browser if requested.")
-        res = subprocess.run([cmd], env=env, check=False)
-        if res.returncode != 0:
-            raise SystemExit(f"agy exited with code {res.returncode}.")
+        print(
+            "Note: On macOS, if a dialog appears saying 'a keychain cannot be found to store \"antigravity\"', "
+            "you can safely click Cancel. Authentication tokens are stored directly in account files."
+        )
 
-        add_account(label=label, home_dir=str(home_dir), enabled=True)
-        print(f"Successfully saved account '{label}' to registry.")
+        # Do not raise on returncode != 0 (macOS keychain dialog cancel causes non-zero exit)
+        subprocess.run([cmd], env=env, check=False)
+
+        token_path = find_account_token_path(home_dir)
+        if not token_path:
+            if is_staging:
+                shutil.rmtree(home_dir, ignore_errors=True)
+            raise SystemExit("Error: Authentication failed. No OAuth token file was found after running agy.")
+
+        extracted_email = extract_email_from_token_file(token_path)
+        if user_label:
+            final_label = user_label
+            final_home = home_dir
+        else:
+            if extracted_email:
+                final_label = extracted_email
+            else:
+                if sys.stdin.isatty():
+                    try:
+                        final_label = input("Account label: ").strip()
+                    except (EOFError, KeyboardInterrupt):
+                        final_label = ""
+                else:
+                    final_label = ""
+                if not final_label:
+                    existing_labels = {acc.get("label") for acc in list_accounts()}
+                    idx = len(existing_labels) + 1
+                    while f"account-{idx}" in existing_labels:
+                        idx += 1
+                    final_label = f"account-{idx}"
+
+            folder_name = sanitize_folder_name(final_label)
+            final_home = accounts_dir / folder_name
+            if home_dir != final_home:
+                if final_home.exists():
+                    shutil.rmtree(final_home, ignore_errors=True)
+                shutil.move(str(home_dir), str(final_home))
+                with contextlib.suppress(OSError):
+                    final_home.chmod(0o700)
+
+        # Check eligibility
+        is_eligible, usage_data = check_account_eligibility(final_home)
+
+        add_account(
+            label=final_label,
+            home_dir=str(final_home),
+            enabled=True,
+            eligible=is_eligible,
+            email=extracted_email,
+        )
+
+        print(f"Successfully saved account '{final_label}' to registry.")
+        if is_eligible:
+            print("Status: Eligible for Antigravity subscription quota.")
+            if usage_data:
+                g_5h = usage_data.get("gemini", {}).get("5h", {}).get("remaining_fraction")
+                g_wk = usage_data.get("gemini", {}).get("weekly", {}).get("remaining_fraction")
+                c_5h = usage_data.get("claude_gpt", {}).get("5h", {}).get("remaining_fraction")
+                c_wk = usage_data.get("claude_gpt", {}).get("weekly", {}).get("remaining_fraction")
+                if g_5h is not None and g_wk is not None:
+                    print(f"  Gemini Quota (5h / Wk): {int(g_5h * 100)}% / {int(g_wk * 100)}%")
+                if c_5h is not None and c_wk is not None:
+                    print(f"  Claude/GPT Quota (5h / Wk): {int(c_5h * 100)}% / {int(c_wk * 100)}%")
+        else:
+            print("Status: NOT eligible for Antigravity subscription quota.")
+            print("Notice: Account is registered but will be bypassed during quota rotation.")
+
         return True
 
     if action == "status":
         accounts = list_accounts()
         active = get_active()
-        if not accounts:
-            print(
-                "No Antigravity accounts registered.\n"
-                "Run `hermes auth add antigravity-subscription-directsdk --label <name>` to add an account."
-            )
-            return True
+        rotation_mode = get_rotation_mode()
 
-        headers = ["Label", "Active", "Enabled", "Cooldown", "Gemini (5h / Wk)", "Claude/GPT (5h / Wk)"]
-        row_format = "{:<16} {:<8} {:<9} {:<12} {:<20} {:<20}"
+        headers = ["Label", "Active", "Enabled", "Eligible", "Cooldown", "Gemini (5h / Wk)", "Claude/GPT (5h / Wk)"]
+        row_format = "{:<22} {:<8} {:<9} {:<10} {:<12} {:<20} {:<20}"
+        divider = "-" * 105
         print(row_format.format(*headers))
-        print("-" * 85)
+        print(divider)
 
         now = time.time()
+
+        # Host default account
+        host_home = Path.home()
+        host_usage = fetch_usage_for_home(str(host_home), cached=False)
+        is_host_active = (rotation_mode == "off") or (not accounts) or (active == "(host default)")
+
+        host_act_str = "*" if is_host_active else ""
+        host_en_str = "yes"
+        host_elig_str = "yes" if host_usage is not None else "unknown"
+        host_cd_str = "ready"
+
+        if host_usage:
+            g_5h = host_usage.get("gemini", {}).get("5h", {}).get("remaining_fraction")
+            g_wk = host_usage.get("gemini", {}).get("weekly", {}).get("remaining_fraction")
+            c_5h = host_usage.get("claude_gpt", {}).get("5h", {}).get("remaining_fraction")
+            c_wk = host_usage.get("claude_gpt", {}).get("weekly", {}).get("remaining_fraction")
+            g_str = f"{int(g_5h * 100)}% / {int(g_wk * 100)}%" if g_5h is not None and g_wk is not None else "n/a"
+            c_str = f"{int(c_5h * 100)}% / {int(c_wk * 100)}%" if c_5h is not None and c_wk is not None else "n/a"
+        else:
+            g_str = "unknown"
+            c_str = "unknown"
+
+        print(row_format.format("(host default)", host_act_str, host_en_str, host_elig_str, host_cd_str, g_str, c_str))
+        print(f"  Home: {_shorten_home(str(host_home))}")
+
         for acc in accounts:
             lbl = acc.get("label", "")
-            is_act = "*" if lbl == active else ""
+            is_act = "*" if (not is_host_active and lbl == active) else ""
             en = "yes" if acc.get("enabled", True) else "no"
+            elig = "yes" if acc.get("eligible", True) else "no"
             cd_until = acc.get("cooldown_until", 0.0)
             if cd_until > now:
                 cd_str = f"{int(cd_until - now)}s"
@@ -318,22 +431,19 @@ def antigravity_auth_handler(action: str, args: Any) -> bool:
                 g_wk = usage.get("gemini", {}).get("weekly", {}).get("remaining_fraction")
                 c_5h = usage.get("claude_gpt", {}).get("5h", {}).get("remaining_fraction")
                 c_wk = usage.get("claude_gpt", {}).get("weekly", {}).get("remaining_fraction")
-
-                gemini_str = (
-                    f"{int(g_5h * 100)}% / {int(g_wk * 100)}%"
-                    if g_5h is not None and g_wk is not None
-                    else "n/a"
-                )
-                claude_str = (
-                    f"{int(c_5h * 100)}% / {int(c_wk * 100)}%"
-                    if c_5h is not None and c_wk is not None
-                    else "n/a"
-                )
+                gemini_str = f"{int(g_5h * 100)}% / {int(g_wk * 100)}%" if g_5h is not None and g_wk is not None else "n/a"
+                claude_str = f"{int(c_5h * 100)}% / {int(c_wk * 100)}%" if c_5h is not None and c_wk is not None else "n/a"
             else:
                 gemini_str = "unknown"
                 claude_str = "unknown"
 
-            print(row_format.format(lbl, is_act, en, cd_str, gemini_str, claude_str))
+            print(row_format.format(lbl, is_act, en, elig, cd_str, gemini_str, claude_str))
+            print(f"  Home: {_shorten_home(acc.get('home_dir', ''))}")
+
+        if not accounts:
+            print("\n(No additional Antigravity accounts registered.)")
+            print("Run `hermes auth add antigravity-subscription-directsdk` to add an account.")
+
         return True
 
     if action in ("logout", "remove"):
