@@ -55,6 +55,9 @@ from providers.base import ProviderProfile
 
 logger = logging.getLogger(__name__)
 
+# An interactive sign-in that never returns must not hang the CLI forever.
+_LOGIN_TIMEOUT_SECONDS = 600.0
+
 _FALLBACK_MODELS = (
     "gemini-3.8-flash",
     "gemini-3.7-flash",
@@ -314,8 +317,21 @@ def antigravity_auth_handler(action: str, args: Any) -> bool:
             "you can safely click Cancel. Authentication tokens are stored directly in account files."
         )
 
-        # Do not raise on returncode != 0 (macOS keychain dialog cancel causes non-zero exit)
-        subprocess.run([cmd], env=env, check=False)
+        # Do not raise on returncode != 0 (macOS keychain dialog cancel causes non-zero exit).
+        # Output stays inherited so the browser prompt remains visible; the timeout
+        # only stops a sign-in that never finishes from hanging the CLI forever.
+        try:
+            login_proc = subprocess.run([cmd], env=env, check=False, timeout=_LOGIN_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired:
+            if is_staging:
+                shutil.rmtree(home_dir, ignore_errors=True)
+            raise SystemExit(
+                "Error: Antigravity sign-in did not finish within "
+                f"{int(_LOGIN_TIMEOUT_SECONDS // 60)} minutes; nothing was registered."
+            )
+        rc = getattr(login_proc, "returncode", 0)
+        if isinstance(rc, int) and rc != 0:
+            print(f"Note: agy exited with code {rc}.")
 
         token_path = find_account_token_path(home_dir)
         if not token_path:
@@ -476,6 +492,16 @@ def antigravity_auth_handler(action: str, args: Any) -> bool:
             print("No Antigravity accounts registered.")
             return True
 
+        # Without a TTY there is no way to ask which account to drop, and
+        # removing one (or all) of them silently from a script is a footgun:
+        # require an explicit label instead.
+        if not sys.stdin.isatty():
+            raise SystemExit(
+                "Error: refusing to remove registered Antigravity accounts from a "
+                "non-interactive session with no account label given. Pass the label "
+                "to remove, or run the command from a terminal."
+            )
+
         if len(accounts) == 1:
             lbl = accounts[0]["label"]
             remove_account(lbl)
@@ -504,10 +530,14 @@ def antigravity_auth_handler(action: str, args: Any) -> bool:
             else:
                 raise SystemExit("Error: No account selected.")
 
-        for acc in accounts:
-            remove_account(acc["label"])
-        print(f"Logged out of Antigravity ({len(accounts)} account(s) removed from registry). Home directories preserved.")
-        return True
+        # Defensive: the guard above already rejects every non-interactive path,
+        # and the interactive path above always returns. Keep the refusal here so
+        # a future edit cannot silently re-introduce an unattended mass removal.
+        raise SystemExit(
+            "Error: refusing to remove every registered Antigravity account from a "
+            "non-interactive session. Pass the account label to remove, or run the "
+            "command from a terminal."
+        )
 
     if action == "refresh":
         target = (getattr(args, "target", None) or getattr(args, "label", None) or "").strip()

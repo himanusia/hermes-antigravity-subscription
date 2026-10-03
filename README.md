@@ -226,10 +226,11 @@ hermes auth logout antigravity-subscription-directsdk work
 Configured via `ANTIGRAVITY_ROTATION` environment variable in your `~/.hermes/config.yaml` or shell environment:
 
 - `off` (default): Always use the host default account or the single active account.
-- `quota`: Automatically pick the account with the highest score `f_5h * (f_weekly ** 2)` on each request. Ineligible accounts and accounts with 0% remaining quota in either the 5-hour or weekly window are hard-gated (score = 0.0).
+- `quota`: Automatically pick the healthiest account on each request. Ineligible accounts, accounts on cooldown, and accounts with 0% remaining quota in either window are hard-gated (score = 0.0). The score is `f_5h * (f_weekly ** 2)` scaled by how soon each window resets (a window about to reset is worth spending) and divided by the number of in-flight turns on that account, so parallel work spreads out. An account whose quota could not be read is scored as half-full and damped, so it never outranks an account with a known healthy quota.
 - `round_robin`: Cycle through available, eligible accounts sequentially.
+- `fixed`: Always use the pinned account (`hermes antigravity use <label>`); falls back to the host default if that account is unusable.
 
-If an account encounters a quota or rate limit error (HTTP 429 / resource exhausted), it is placed on a cooldown and Hermes automatically fails over to the next best available account.
+If an account encounters a quota error (HTTP 429 / resource exhausted), it is placed on a cooldown until the window resets and Hermes automatically fails over to the next best available account — including while rotation is `off`, so a depleted account swaps accounts instead of degrading to another model. Transient rate limiting alone does not trigger a swap.
 
 Account credentials are stored under `~/.agy-accounts/<label>/` and the registry file is stored at `~/.hermes/antigravity-accounts.json` (configurable via `ANTIGRAVITY_ACCOUNTS_DIR` and `ANTIGRAVITY_ACCOUNTS_FILE`).
 

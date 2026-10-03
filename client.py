@@ -55,7 +55,9 @@ try:
         fetch_usage_for_home,
         get_rotation_mode,
         is_quota_error,
+        acquire_lease,
         lease_account,
+        release_lease,
         parse_reset_time,
         is_failover_enabled,
         has_registered_accounts,
@@ -97,7 +99,9 @@ except ImportError:
         fetch_usage_for_home,
         get_rotation_mode,
         is_quota_error,
+        acquire_lease,
         lease_account,
+        release_lease,
         parse_reset_time,
         is_failover_enabled,
         has_registered_accounts,
@@ -328,6 +332,7 @@ class _RotatingStreamWrapper:
         max_attempts: int = 3,
         session_id: str | None = None,
         force_mode: str | None = None,
+        lease_label: str | None = None,
     ) -> None:
         self.client = client
         self.resolved_model = resolved_model
@@ -342,6 +347,10 @@ class _RotatingStreamWrapper:
         self.max_attempts = max_attempts
         self.session_id = session_id
         self.force_mode = force_mode
+        # The streamed turn owns its account lease: it stays held until the
+        # stream is exhausted or closed, not just until the wrapper is built.
+        self._lease_label = (lease_label or "").strip() or None
+        self._lease_held = self._lease_label is not None
         self.chunks_yielded = 0
 
     def _failover(self, exc: Exception) -> bool:
@@ -369,6 +378,9 @@ class _RotatingStreamWrapper:
             return False
 
         self.tried_labels.add(next_acc["label"])
+        # The turn moved to another account, so the lease must move with it or
+        # the account that failed over stays leased forever.
+        self._move_lease(str(next_acc.get("label") or ""))
         self.current_account = next_acc
         self.current_stream = iter(
             self.client._execute_chat_completion(
@@ -385,6 +397,26 @@ class _RotatingStreamWrapper:
         )
         return True
 
+    def _release_lease(self) -> None:
+        """Release the held account lease once; later calls are no-ops."""
+        if self._lease_held and self._lease_label:
+            release_lease(self._lease_label)
+        self._lease_held = False
+
+    def _move_lease(self, label: str) -> None:
+        """Move the lease to the account this stream just failed over to."""
+        self._release_lease()
+        norm = (label or "").strip()
+        if norm:
+            acquire_lease(norm)
+            self._lease_label = norm
+            self._lease_held = True
+
+    def __del__(self) -> None:
+        # Last resort for a consumer that abandons the stream without closing it.
+        with contextlib.suppress(Exception):
+            self._release_lease()
+
     def __iter__(self) -> Any:
         return self
 
@@ -395,10 +427,12 @@ class _RotatingStreamWrapper:
                 self.chunks_yielded += 1
                 return chunk
             except StopIteration:
+                self._release_lease()
                 raise
             except Exception as exc:
                 if self._failover(exc):
                     continue
+                self._release_lease()
                 raise
 
     def __aiter__(self) -> Any:
@@ -411,10 +445,12 @@ class _RotatingStreamWrapper:
                 self.chunks_yielded += 1
                 return chunk
             except StopAsyncIteration:
+                self._release_lease()
                 raise
             except Exception as exc:
                 if self._failover(exc):
                     continue
+                self._release_lease()
                 raise
 
     def __await__(self) -> Any:
@@ -425,7 +461,10 @@ class _RotatingStreamWrapper:
         return _ready(self).__await__()
 
     def close(self) -> None:
-        self.current_stream.close()
+        """Close the underlying stream and drop the held account lease."""
+        with contextlib.suppress(Exception):
+            self.current_stream.close()
+        self._release_lease()
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self.current_stream, name)
@@ -1028,7 +1067,10 @@ class AntigravityClient:
             tried_labels.add(label)
 
             if stream:
-                with lease_account(label):
+                # Acquire before the call so two concurrent turns cannot pick
+                # the same account; ownership transfers to the returned stream.
+                acquire_lease(label)
+                try:
                     raw_stream = self._execute_chat_completion(
                         resolved_model=resolved_model,
                         effort=effort,
@@ -1053,9 +1095,14 @@ class AntigravityClient:
                         tried_labels=tried_labels,
                         max_attempts=max_attempts,
                         session_id=eff_session_id,
+                        lease_label=label,
                     )
                     update_last_used(label)
                     return wrapper
+                except BaseException:
+                    # The stream never came back: nothing owns the lease yet.
+                    release_lease(label)
+                    raise
 
             try:
                 with lease_account(label):
