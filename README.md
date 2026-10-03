@@ -218,7 +218,7 @@ hermes auth logout antigravity-subscription-directsdk work
 
 - **Optional Label & Safe Directory Names**: `--label` is optional. When omitted, the plugin extracts the email address directly from the JWT `id_token` payload in the newly saved token file. The home directory name is sanitized for cross-platform compatibility (`[A-Za-z0-9._-]`), while the saved label retains the full email address.
 - **Token File-based Authentication**: Success is determined by the presence of the OAuth token file (`antigravity-oauth-token` or `jetski-standalone-oauth-token`), rather than the process exit code.
-- **macOS Keychain Dialog**: On macOS, a system dialog may prompt: *"a keychain cannot be found to store 'antigravity'"*. You can safely click **Cancel**. Account credentials are stored securely in isolated token files and do not affect the host keychain.
+- **macOS Keychain Dialog**: A registered account's HOME has no keychain (agy's keychain item has a fixed name, so a shared keychain would let accounts overwrite each other). The plugin runs agy for registered accounts with `SSH_CONNECTION` set, which makes agy keep the token in its file and skip the keychain, so token refreshes no longer pop *"a keychain cannot be found to store 'antigravity'"*. The interactive sign-in (`hermes auth add`) can still show it once; click **Cancel**.
 - **Automatic Eligibility Check**: Upon sign-in, the plugin validates subscription eligibility via `agy -p /usage --output-format json`. Ineligible accounts are saved with `eligible: false` and are automatically bypassed during quota rotation.
 
 #### Rotation Modes

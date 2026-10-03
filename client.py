@@ -63,6 +63,7 @@ try:
         has_registered_accounts,
         pick_account,
         set_cooldown,
+        apply_file_token_storage,
         record_serving_account,
         update_last_used,
     )
@@ -108,6 +109,7 @@ except ImportError:
         has_registered_accounts,
         pick_account,
         set_cooldown,
+        apply_file_token_storage,
         record_serving_account,
         update_last_used,
     )
@@ -585,8 +587,10 @@ class AntigravityClient:
         return resolve_model_and_effort(model, reasoning_effort)
 
     def _child_env(self, home_dir: Path | str | None = None) -> dict[str, str]:
-        target_home = home_dir if home_dir is not None else self._isolated_home
-        return build_child_env(target_home)
+        if home_dir is None:
+            return build_child_env(self._isolated_home)
+        # A registered account's HOME: keep its token in the file (no keychain dialog).
+        return apply_file_token_storage(build_child_env(home_dir))
 
     @staticmethod
     def _terminate_process(proc: subprocess.Popen) -> None:
