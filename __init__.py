@@ -139,8 +139,14 @@ class AntigravitySubscriptionDirectSDKProfile(ProviderProfile):
 
         cmd = resolve_agy_command()
         try:
+            try:  # a model-listing probe must never open a browser window
+                from .accounts import apply_browser_block
+            except ImportError:
+                from accounts import apply_browser_block
+
             res = subprocess.run(
                 [cmd, "models"],
+                env=apply_browser_block(dict(os.environ)),
                 capture_output=True,
                 text=True,
                 timeout=timeout,
