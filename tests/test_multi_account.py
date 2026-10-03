@@ -269,6 +269,27 @@ class TestMultiAccount(unittest.TestCase):
                     with lease_account("acc_high"):
                         pass
 
+    def test_pick_account_skips_accounts_without_the_model(self):
+        add_account("old", "/path/old")
+        add_account("new", "/path/new")
+        listing = {
+            str(Path("/path/old").resolve()): ("gemini-3.8-flash-high", "claude-sonnet-4-6"),
+            str(Path("/path/new").resolve()): ("gemini-3.8-flash-high", "claude-sonnet-5-5-medium"),
+        }
+
+        def fake_models(home, timeout=15.0):
+            return listing.get(str(Path(home).resolve()), ()) if home else ()
+
+        with patch("accounts.list_models_for_home", side_effect=fake_models), \
+                patch("accounts.fetch_usage_for_home", return_value=None), \
+                patch.dict(os.environ, {"ANTIGRAVITY_ROTATION": "round_robin"}):
+            self.assertEqual(pick_account(model="claude-sonnet-5-5-medium")["label"], "new")
+            self.assertEqual(pick_account(model="claude-sonnet-4-6")["label"], "old")
+            # Effort variants match their base name.
+            self.assertIsNotNone(pick_account(model="gemini-3.8-flash"))
+            # No rotation account has it: fail open to the host default account.
+            self.assertIsNone(pick_account(model="claude-opus-5-5-high"))
+
     def test_pick_account_skips_cooldown(self):
         add_account("acc1", "/path/1")
         add_account("acc2", "/path/2")
