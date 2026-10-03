@@ -19,6 +19,7 @@ from accounts import (  # noqa: E402
     add_account,
     clear_session_pin,
     get_rotation_mode,
+    is_failover_enabled,
     is_quota_ignition_enabled,
     maybe_quota_ignition,
     pick_account,
@@ -215,6 +216,133 @@ class QuotaIgnitionTests(unittest.TestCase):
         with patch.dict(accounts._IGNITION_FIRED, {}, clear=True), patch("accounts.subprocess.run") as run:
             self.assertFalse(maybe_quota_ignition(ineligible, usage(1.0, 1.0)))
         run.assert_not_called()
+
+
+class QuotaFailoverTests(unittest.TestCase):
+    """A quota error must swap accounts even while rotation is 'off'."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.env = patch.dict(
+            os.environ,
+            {
+                "ANTIGRAVITY_ACCOUNTS_FILE": str(Path(self.tmp.name) / "accounts.json"),
+                "ANTIGRAVITY_ACCOUNTS_DIR": str(Path(self.tmp.name) / "dir"),
+            },
+            clear=False,
+        )
+        self.env.start()
+        self.addCleanup(self.env.stop)
+        os.environ.pop("ANTIGRAVITY_ROTATION", None)
+        os.environ.pop("ANTIGRAVITY_FAILOVER", None)
+
+    def test_failover_enabled_by_default(self):
+        self.assertTrue(is_failover_enabled())
+        with patch.dict(os.environ, {"ANTIGRAVITY_FAILOVER": "0"}):
+            self.assertFalse(is_failover_enabled())
+
+    def test_force_mode_quota_picks_account_while_mode_is_off(self):
+        add_account("giovani", "/path/g", eligible=True)
+        self.assertEqual(get_rotation_mode(), "off")
+        self.assertIsNone(pick_account(model="gemini-3.8-flash"))
+        with patch("accounts.fetch_usage_for_home", return_value=usage(0.9, 0.8)):
+            picked = pick_account(model="gemini-3.8-flash", force_mode="quota")
+        self.assertIsNotNone(picked)
+        self.assertEqual(picked["label"], "giovani")
+
+    def test_force_mode_quota_is_none_without_accounts(self):
+        self.assertIsNone(pick_account(model="gemini-3.8-flash", force_mode="quota"))
+
+    def test_exhausted_pin_is_dropped_for_a_healthy_account(self):
+        add_account("tired", "/path/tired", eligible=True)
+        add_account("fresh", "/path/fresh", eligible=True)
+        set_rotation_mode("quota")
+        def healthy(home, cached=True):
+            return usage(1.0, 1.0) if home.endswith("tired") else usage(0.6, 0.6)
+
+        with patch("accounts.fetch_usage_for_home", side_effect=healthy):
+            first = pick_account(model="gemini-3.8-flash", session_id="s-exhaust")
+        self.assertEqual(first["label"], "tired")
+
+        def exhausted(home, cached=True):
+            return usage(0.0, 0.4) if home.endswith("tired") else usage(0.6, 0.6)
+
+        with patch("accounts.fetch_usage_for_home", side_effect=exhausted):
+            after = pick_account(model="gemini-3.8-flash", session_id="s-exhaust")
+        clear_session_pin("s-exhaust")
+        self.assertEqual(after["label"], "fresh")
+
+
+class _FakeClient:
+    """Minimal stand-in for AntigravityClient used by the stream wrapper."""
+
+    def __init__(self, stream_chunks):
+        self.stream_chunks = stream_chunks
+        self.calls = []
+
+    def _execute_chat_completion(self, **kwargs):
+        self.calls.append(kwargs)
+        return iter(self.stream_chunks)
+
+
+class StreamFailoverTests(unittest.TestCase):
+    """The stream wrapper swaps accounts on a turn-1 quota error."""
+
+    def _wrapper(self, first_stream, fake):
+        from client import _RotatingStreamWrapper
+
+        return _RotatingStreamWrapper(
+            client=fake,
+            resolved_model="gemini-3.8-flash",
+            effort=None,
+            messages_list=[{"role": "user", "content": "hi"}],
+            effective_timeout=30.0,
+            tools=None,
+            tool_choice=None,
+            initial_account={"label": "", "home_dir": "", "enabled": True, "eligible": True},
+            initial_stream=first_stream,
+            tried_labels={""},
+            max_attempts=3,
+            session_id="s-failover",
+            force_mode="quota",
+        )
+
+    def test_quota_error_swaps_to_registered_account(self):
+        def exploding():
+            raise RuntimeError(
+                "Antigravity model error: Individual quota reached. Please upgrade "
+                "your subscription to increase your limits. Resets in 38m56s."
+            )
+            yield  # pragma: no cover
+
+        fake = _FakeClient(["chunk-from-giovani"])
+        wrapper = self._wrapper(exploding(), fake)
+        with patch(
+            "client.pick_account", return_value={"label": "giovani", "home_dir": "/path/g"}
+        ) as pick, patch("client.set_cooldown") as cooldown:
+            chunks = list(wrapper)
+        self.assertEqual(chunks, ["chunk-from-giovani"])
+        pick.assert_called_once()
+        self.assertEqual(pick.call_args.kwargs.get("force_mode"), "quota")
+        cooldown.assert_not_called()  # the host default has no registry label
+        self.assertEqual(fake.calls[0]["home_dir"], "/path/g")
+        self.assertEqual(fake.calls[0]["account_label"], "giovani")
+
+    def test_no_failover_after_partial_output(self):
+        def exploding_after_chunk():
+            yield "partial"
+            raise RuntimeError("Individual quota reached")
+
+        fake = _FakeClient(["never-used"])
+        wrapper = self._wrapper(exploding_after_chunk(), fake)
+        seen = []
+        with patch("client.pick_account") as pick:
+            with self.assertRaises(RuntimeError):
+                for chunk in wrapper:
+                    seen.append(chunk)
+        self.assertEqual(seen, ["partial"])
+        pick.assert_not_called()
 
 
 if __name__ == "__main__":

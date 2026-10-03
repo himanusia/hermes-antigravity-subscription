@@ -738,15 +738,63 @@ def _account_passes_gates(acc: dict[str, Any], now: float) -> bool:
     return True
 
 
+def is_failover_enabled() -> bool:
+    """Whether a quota error may swap to another account. Default: on.
+
+    Deliberately independent of the rotation mode: even with rotation 'off'
+    (host default account) a quota-exhausted turn should move to a healthy
+    registered account instead of letting Hermes degrade to another model.
+    Disable with ANTIGRAVITY_FAILOVER=0.
+    """
+    val = os.environ.get("ANTIGRAVITY_FAILOVER", "").strip().lower()
+    return val not in ("0", "false", "no", "off")
+
+
+def has_registered_accounts() -> bool:
+    """Whether any account is registered. With none, nothing can be failed over to."""
+    try:
+        data = load_accounts()
+    except Exception:
+        return False
+    return bool(data.get("accounts"))
+
+
+def _account_has_quota(acc: dict[str, Any], group_key: str) -> bool:
+    """Whether both windows of the model group still show remaining quota.
+
+    A session pin must not survive quota exhaustion: pinning an account that is
+    at 0% keeps sending turns into a 429 until the window resets. Unknown usage
+    is treated as 'has quota' so a probe failure never drops a good pin.
+    """
+    try:
+        usage = fetch_usage_for_home(acc.get("home_dir", ""), cached=True)
+    except Exception:
+        return True
+    group = usage.get(group_key) if isinstance(usage, dict) else None
+    if not isinstance(group, dict):
+        return True
+    try:
+        f_5h = float(group.get("5h", {}).get("remaining_fraction", 1.0))
+        f_weekly = float(group.get("weekly", {}).get("remaining_fraction", 1.0))
+    except (TypeError, ValueError):
+        return True
+    return f_5h > 0.0 and f_weekly > 0.0
+
+
 def pick_account(
     model: str | None = None,
     exclude_labels: set[str] | list[str] | None = None,
     session_id: str | None = None,
+    force_mode: str | None = None,
 ) -> dict[str, Any] | None:
     """Pick the best available Antigravity account based on configured rotation mode.
 
     Mode precedence: env ANTIGRAVITY_ROTATION, else the registry's persistent
     ``rotation_mode``, else 'off'.
+
+    ``force_mode`` overrides both for one call. Quota failover uses
+    ``force_mode='quota'`` so a quota error can still swap accounts while
+    rotation is 'off'.
 
     'fixed' pins the account chosen by `set_active` (registry's
     ``active_account``), or ANTIGRAVITY_ACCOUNT env (per-session override of the
@@ -760,7 +808,9 @@ def pick_account(
     Fails open by returning None on any registry missing/corrupt or mode 'off'.
     """
     try:
-        mode = get_rotation_mode()
+        mode = (force_mode or "").strip().lower() or get_rotation_mode()
+        if mode not in VALID_ROTATION_MODES:
+            mode = "off"
         if mode == "off":
             return None
 
@@ -798,6 +848,8 @@ def pick_account(
             return acc
 
         # Mode 'quota' / 'round_robin' + session stickiness
+        m_lower = (model or "").lower()
+        group_key = "claude_gpt" if ("claude" in m_lower or "gpt" in m_lower) else "gemini"
         if session_id:
             pinned_label = _get_session_pin(session_id)
             if pinned_label:
@@ -806,14 +858,13 @@ def pick_account(
                     pinned_acc is not None
                     and pinned_acc.get("label") not in excluded
                     and _account_passes_gates(pinned_acc, time.time())
+                    and (mode != "quota" or _account_has_quota(pinned_acc, group_key))
                 ):
                     return pinned_acc
-                # Pin went stale (removed / disabled / / ineligible / cooldown):
-                # reselect below and re-pin.
+                # Pin went stale (removed / disabled / ineligible / cooldown /
+                # exhausted): reselect below and re-pin.
 
         now = time.time()
-        m_lower = (model or "").lower()
-        group_key = "claude_gpt" if ("claude" in m_lower or "gpt" in m_lower) else "gemini"
 
         if mode == "round_robin":
             eligible = [
