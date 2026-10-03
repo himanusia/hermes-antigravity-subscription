@@ -57,6 +57,8 @@ try:
         is_quota_error,
         lease_account,
         parse_reset_time,
+        is_failover_enabled,
+        has_registered_accounts,
         pick_account,
         set_cooldown,
         update_last_used,
@@ -97,6 +99,8 @@ except ImportError:
         is_quota_error,
         lease_account,
         parse_reset_time,
+        is_failover_enabled,
+        has_registered_accounts,
         pick_account,
         set_cooldown,
         update_last_used,
@@ -250,7 +254,10 @@ def _format_account_usage(account: dict[str, Any] | None, model: str | None) -> 
     m_lower = (model or "").lower()
     group_key = "claude_gpt" if ("claude" in m_lower or "gpt" in m_lower) else "gemini"
     group_label = "claude" if group_key == "claude_gpt" else "gemini"
-    usage = fetch_usage_for_home(home_dir, cached=True)
+    try:
+        usage = fetch_usage_for_home(home_dir, cached=True)
+    except Exception:
+        usage = None
     pct = 0
     if usage and group_key in usage:
         f_5h = usage[group_key].get("5h", {}).get("remaining_fraction")
@@ -320,6 +327,7 @@ class _RotatingStreamWrapper:
         tried_labels: set[str],
         max_attempts: int = 3,
         session_id: str | None = None,
+        force_mode: str | None = None,
     ) -> None:
         self.client = client
         self.resolved_model = resolved_model
@@ -333,6 +341,7 @@ class _RotatingStreamWrapper:
         self.tried_labels = set(tried_labels)
         self.max_attempts = max_attempts
         self.session_id = session_id
+        self.force_mode = force_mode
         self.chunks_yielded = 0
 
     def _failover(self, exc: Exception) -> bool:
@@ -342,13 +351,18 @@ class _RotatingStreamWrapper:
         with contextlib.suppress(Exception):
             self.current_stream.close()
 
-        cooldown_ts = _resolve_cooldown_reset(self.current_account, self.resolved_model)
-        set_cooldown(self.current_account["label"], until=cooldown_ts)
+        # The host default account has no registry entry: nothing to cool down,
+        # and no label to exclude.
+        current_label = str(self.current_account.get("label") or "").strip()
+        if current_label:
+            cooldown_ts = _resolve_cooldown_reset(self.current_account, self.resolved_model)
+            set_cooldown(current_label, until=cooldown_ts)
 
         next_acc = pick_account(
             model=self.resolved_model,
             exclude_labels=self.tried_labels,
             session_id=self.session_id,
+            force_mode=self.force_mode,
         )
         _log_rotation_failover(self.current_account, next_acc, self.resolved_model)
         if not next_acc:
@@ -904,18 +918,86 @@ class AntigravityClient:
         )
 
         rotation_mode = get_rotation_mode()
-        if rotation_mode == "off":
-            return self._execute_chat_completion(
-                resolved_model=resolved_model,
-                effort=effort,
-                messages_list=messages_list,
-                effective_timeout=effective_timeout,
-                tools=tools,
-                tool_choice=tool_choice,
-                stream=stream,
-            )
-
         max_attempts = 3
+        if rotation_mode == "off":
+            # Rotation is off (host default account). A quota error must still move
+            # to a healthy registered account instead of letting Hermes degrade to
+            # another model — but only when accounts exist to fail over to.
+            if not is_failover_enabled() or not has_registered_accounts():
+                return self._execute_chat_completion(
+                    resolved_model=resolved_model,
+                    effort=effort,
+                    messages_list=messages_list,
+                    effective_timeout=effective_timeout,
+                    tools=tools,
+                    tool_choice=tool_choice,
+                    stream=stream,
+                )
+            host_account: dict[str, Any] = {
+                "label": "",
+                "home_dir": "",
+                "enabled": True,
+                "eligible": True,
+            }
+            if stream:
+                raw_host_stream = self._execute_chat_completion(
+                    resolved_model=resolved_model,
+                    effort=effort,
+                    messages_list=messages_list,
+                    effective_timeout=effective_timeout,
+                    tools=tools,
+                    tool_choice=tool_choice,
+                    stream=True,
+                )
+                return _RotatingStreamWrapper(
+                    client=self,
+                    resolved_model=resolved_model,
+                    effort=effort,
+                    messages_list=messages_list,
+                    effective_timeout=effective_timeout,
+                    tools=tools,
+                    tool_choice=tool_choice,
+                    initial_account=host_account,
+                    initial_stream=raw_host_stream,
+                    tried_labels={""},
+                    max_attempts=max_attempts,
+                    session_id=eff_session_id,
+                    force_mode="quota",
+                )
+            try:
+                return self._execute_chat_completion(
+                    resolved_model=resolved_model,
+                    effort=effort,
+                    messages_list=messages_list,
+                    effective_timeout=effective_timeout,
+                    tools=tools,
+                    tool_choice=tool_choice,
+                    stream=False,
+                )
+            except Exception as exc:
+                if not is_quota_error(exc):
+                    raise
+                next_acc = pick_account(
+                    model=resolved_model,
+                    exclude_labels={""},
+                    session_id=eff_session_id,
+                    force_mode="quota",
+                )
+                _log_rotation_failover(host_account, next_acc, resolved_model)
+                if not next_acc:
+                    raise
+                update_last_used(next_acc["label"])
+                return self._execute_chat_completion(
+                    resolved_model=resolved_model,
+                    effort=effort,
+                    messages_list=messages_list,
+                    effective_timeout=effective_timeout,
+                    tools=tools,
+                    tool_choice=tool_choice,
+                    stream=False,
+                    home_dir=next_acc["home_dir"],
+                    account_label=next_acc["label"],
+                )
         tried_labels: set[str] = set()
         last_exc: Exception | None = None
 
