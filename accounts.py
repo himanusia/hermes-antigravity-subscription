@@ -153,7 +153,9 @@ def save_accounts(data: dict[str, Any]) -> None:
 
 def sanitize_folder_name(name: str) -> str:
     """Sanitize a label or email for safe filesystem folder naming across OSes."""
-    sanitized = re.sub(r"[^A-Za-z0-9._-]", "-", name.strip())
+    # Strip leading/trailing dots and dashes: the result is joined onto the
+    # accounts directory, so a label such as '..' would address its parent.
+    sanitized = re.sub(r"[^A-Za-z0-9._-]", "-", name.strip()).strip(".-")
     return sanitized or "account"
 
 
@@ -415,6 +417,9 @@ def parse_reset_time(reset_time_str: str | None) -> float | None:
     try:
         clean = reset_time_str.strip().replace("Z", "+00:00")
         dt = datetime.fromisoformat(clean)
+        if dt.tzinfo is None:
+            # agy reports UTC; a bare stamp must not be read as local time.
+            dt = dt.replace(tzinfo=timezone.utc)
         return dt.timestamp()
     except Exception:
         return None
@@ -595,6 +600,12 @@ def fetch_usage_for_home(
 
 VALID_ROTATION_MODES = ("off", "quota", "round_robin", "fixed")
 
+# A quota probe that fails must never look like a full tank: the account is
+# scored half-full and then damped, so any account with a known healthy quota
+# wins the pick and an unreadable account is only used when nothing else is left.
+_UNKNOWN_USAGE_FRACTION = 0.5
+_UNKNOWN_USAGE_PENALTY = 0.5
+
 # Opt-in quota ignition: start the 5-hour usage window on an idle account so the
 # full budget is available when the user actually needs it. Disabled by default —
 # see `maybe_quota_ignition` for the triggers and safety rules.
@@ -649,19 +660,32 @@ def is_quota_ignition_enabled() -> bool:
     return bool(data.get("quota_ignition", False))
 
 
-@contextlib.contextmanager
-def lease_account(label: str):
-    """Thread-safe context manager tracking in-flight turn leases per account."""
+def acquire_lease(label: str) -> None:
+    """Take a turn lease on an account without entering a context manager."""
     norm = label.strip()
     with _LEASE_LOCK:
         _ACTIVE_LEASES[norm] = _ACTIVE_LEASES.get(norm, 0) + 1
+
+
+def release_lease(label: str) -> None:
+    """Drop one turn lease; releasing an unleased account is a no-op."""
+    norm = label.strip()
+    with _LEASE_LOCK:
+        remaining = _ACTIVE_LEASES.get(norm, 0) - 1
+        if remaining > 0:
+            _ACTIVE_LEASES[norm] = remaining
+        else:
+            _ACTIVE_LEASES.pop(norm, None)
+
+
+@contextlib.contextmanager
+def lease_account(label: str):
+    """Thread-safe context manager tracking in-flight turn leases per account."""
+    acquire_lease(label)
     try:
         yield
     finally:
-        with _LEASE_LOCK:
-            _ACTIVE_LEASES[norm] = max(0, _ACTIVE_LEASES.get(norm, 1) - 1)
-            if _ACTIVE_LEASES[norm] == 0:
-                _ACTIVE_LEASES.pop(norm, None)
+        release_lease(label)
 
 
 def get_lease_count(label: str) -> int:
@@ -814,8 +838,9 @@ def is_quota_error(error: Exception | str) -> bool:
             "individual quota reached",
             "quota exceeded",
             "quota limit",
-            "rate limit",
             "429",
+            # "rate limit" is deliberately absent: transient throttling is not
+            # quota exhaustion and must not trigger an account swap.
         )
     )
 
@@ -1129,19 +1154,28 @@ def pick_account(
                 lbl = str(acc.get("label", "") or "")
                 if not lbl or lbl in excluded or not _account_passes_gates(acc, now):
                     continue
-                f_5h = 1.0
-                f_weekly = 1.0
+                f_5h = _UNKNOWN_USAGE_FRACTION
+                f_weekly = _UNKNOWN_USAGE_FRACTION
                 reset_5h: str | None = None
                 reset_week: str | None = None
+                quota_known = False
                 usage = fetch_usage_for_home(acc.get("home_dir", ""), cached=True)
                 group = usage.get(group_key) if usage and isinstance(usage, dict) else None
                 if isinstance(group, dict):
                     b5 = group.get("5h", {}) if isinstance(group.get("5h", {}), dict) else {}
                     bwk = group.get("weekly", {}) if isinstance(group.get("weekly", {}), dict) else {}
-                    f_5h = b5.get("remaining_fraction", 1.0)
-                    f_weekly = bwk.get("remaining_fraction", 1.0)
-                    reset_5h = b5.get("reset_time") or None
-                    reset_week = bwk.get("reset_time") or None
+                    try:
+                        raw_5h = b5.get("remaining_fraction")
+                        raw_week = bwk.get("remaining_fraction")
+                        if raw_5h is not None and raw_week is not None:
+                            f_5h = float(raw_5h)
+                            f_weekly = float(raw_week)
+                            reset_5h = b5.get("reset_time") or None
+                            reset_week = bwk.get("reset_time") or None
+                            quota_known = True
+                    except (TypeError, ValueError):
+                        # A hand-edited or unexpected payload is 'unknown', not fatal.
+                        quota_known = False
 
                 score = calculate_score(
                     f_5h=f_5h,
@@ -1153,6 +1187,8 @@ def pick_account(
                     reset_week_time=reset_week,
                 )
                 if score > 0.0:
+                    if not quota_known:
+                        score *= _UNKNOWN_USAGE_PENALTY
                     scored.append((score, acc, usage))
 
             if not scored:

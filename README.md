@@ -244,7 +244,7 @@ Model access is per Google account (one account may list Claude 5.5 while anothe
 
 The account serving requests is recorded in the registry (`serving`), and `/usage` meters that account: the snapshot title ends with the account label (`default` for the host login).
 
-If an account encounters a quota or rate limit error (HTTP 429 / resource exhausted), it is placed on a cooldown and Hermes automatically fails over to the next best available account.
+If an account encounters a quota error (HTTP 429 / resource exhausted), it is placed on a cooldown until the window resets and Hermes automatically fails over to the next best available account — including while rotation is `off`, so a depleted account swaps accounts instead of degrading to another model. Transient rate limiting alone does not trigger a swap.
 
 Account credentials are stored under `~/.agy-accounts/<label>/` and the registry file is stored at `~/.hermes/antigravity-accounts.json` (configurable via `ANTIGRAVITY_ACCOUNTS_DIR` and `ANTIGRAVITY_ACCOUNTS_FILE`).
 

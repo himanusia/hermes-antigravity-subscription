@@ -3,6 +3,7 @@ import base64
 import io
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import time
@@ -20,6 +21,7 @@ if str(plugin_dir) not in sys.path:
 from accounts import (
     DEFAULT_ACCOUNTS_DIR,
     _parse_usage_json,
+    acquire_lease,
     add_account,
     calculate_score,
     check_account_eligibility,
@@ -49,7 +51,7 @@ from accounts import (
     VALID_ROTATION_MODES,
 )
 from __init__ import antigravity_profile, auth_handler
-from client import AntigravityClient, _log_rotation_failover, _resolve_cooldown_reset
+from client import AntigravityClient, _RotatingStreamWrapper, _log_rotation_failover, _resolve_cooldown_reset
 
 def make_mock_id_token(email: str) -> str:
     header = base64.urlsafe_b64encode(json.dumps({"alg": "RS256"}).encode()).decode().rstrip("=")
@@ -691,7 +693,7 @@ class TestMultiAccount(unittest.TestCase):
 
     def test_auth_handler_status_empty(self):
         out = io.StringIO()
-        with patch("sys.stdout", out), patch("accounts.fetch_usage_for_home", return_value=None):
+        with patch("sys.stdout", out), patch("__init__.fetch_usage_for_home", return_value=None):
             res = auth_handler("status", SimpleNamespace())
         self.assertTrue(res)
         val = out.getvalue()
@@ -704,7 +706,7 @@ class TestMultiAccount(unittest.TestCase):
         add_account("acc_alpha", "/path/alpha", eligible=True)
         set_active("acc_alpha")
         out = io.StringIO()
-        with patch("sys.stdout", out), patch("accounts.fetch_usage_for_home", return_value=None):
+        with patch("sys.stdout", out), patch("__init__.fetch_usage_for_home", return_value=None):
             res = auth_handler("status", SimpleNamespace())
         self.assertTrue(res)
         val = out.getvalue()
@@ -716,7 +718,7 @@ class TestMultiAccount(unittest.TestCase):
         add_account("acc_ok", "/path/ok", eligible=True)
         add_account("acc_bad", "/path/bad", eligible=False)
         out = io.StringIO()
-        with patch("sys.stdout", out), patch("accounts.fetch_usage_for_home", return_value=None):
+        with patch("sys.stdout", out), patch("__init__.fetch_usage_for_home", return_value=None):
             res = auth_handler("status", SimpleNamespace())
         self.assertTrue(res)
         warnings = [line for line in out.getvalue().splitlines() if line.startswith("WARNING")]
@@ -727,7 +729,7 @@ class TestMultiAccount(unittest.TestCase):
     def test_auth_handler_status_quiet_when_all_eligible(self):
         add_account("acc_ok", "/path/ok", eligible=True)
         out = io.StringIO()
-        with patch("sys.stdout", out), patch("accounts.fetch_usage_for_home", return_value=None):
+        with patch("sys.stdout", out), patch("__init__.fetch_usage_for_home", return_value=None):
             auth_handler("status", SimpleNamespace())
         self.assertNotIn("WARNING", out.getvalue())
 
@@ -735,7 +737,7 @@ class TestMultiAccount(unittest.TestCase):
         add_account("acc_alpha", "/path/alpha")
         set_cooldown("acc_alpha", duration_seconds=600)
 
-        with patch("accounts.fetch_usage_for_home", return_value=None):
+        with patch("__init__.fetch_usage_for_home", return_value=None):
             # Target refresh
             res = auth_handler("refresh", SimpleNamespace(target="acc_alpha"))
             self.assertTrue(res)
@@ -766,8 +768,16 @@ class TestMultiAccount(unittest.TestCase):
         with self.assertRaises(SystemExit):
             auth_handler("logout", SimpleNamespace(target="acc1"))
 
-        # Logout remaining account (single account path)
-        res = auth_handler("logout", SimpleNamespace(target=None))
+        # Logout without a target and without a TTY: refused, registry intact.
+        with patch("sys.stdin.isatty", return_value=False):
+            with self.assertRaises(SystemExit) as ctx:
+                auth_handler("logout", SimpleNamespace(target=None))
+        self.assertIn("non-interactive", str(ctx.exception))
+        self.assertEqual(len(list_accounts()), 1)
+
+        # Same call from a terminal removes the remaining account.
+        with patch("sys.stdin.isatty", return_value=True):
+            res = auth_handler("logout", SimpleNamespace(target=None))
         self.assertTrue(res)
         self.assertEqual(len(list_accounts()), 0)
 
@@ -802,5 +812,157 @@ class TestMultiAccount(unittest.TestCase):
                 )
 
 
+class HardeningTests(unittest.TestCase):
+    """Regressions for review findings on the multi-account branch."""
+
+    def test_sanitize_folder_name_cannot_escape_accounts_dir(self):
+        for raw in ("..", ".", "...", "  ..  "):
+            self.assertEqual(sanitize_folder_name(raw), "account")
+        self.assertEqual(sanitize_folder_name("../../etc/passwd"), "etc-passwd")
+        self.assertEqual(sanitize_folder_name("giovani"), "giovani")
+        self.assertEqual(sanitize_folder_name("john.doe+work@company.com"), "john.doe-work-company.com")
+        for raw in ("a/b/../c", "../..", "/etc/passwd"):
+            self.assertNotIn("/", sanitize_folder_name(raw))
+
+    def test_parse_reset_time_treats_naive_stamp_as_utc(self):
+        naive = parse_reset_time("2026-10-04T00:00:00")
+        utc = parse_reset_time("2026-10-04T00:00:00Z")
+        offset = parse_reset_time("2026-10-04T07:00:00+07:00")
+        self.assertIsNotNone(naive)
+        self.assertEqual(naive, utc)
+        self.assertEqual(utc, offset)
+        self.assertIsNone(parse_reset_time(None))
+        self.assertIsNone(parse_reset_time("not-a-timestamp"))
+
+    def test_is_quota_error_ignores_transient_rate_limit(self):
+        self.assertTrue(is_quota_error("Individual quota reached"))
+        self.assertTrue(is_quota_error("ResourceExhausted: quota limit hit"))
+        self.assertFalse(is_quota_error("Rate limit exceeded, retry in 5s"))
+        self.assertFalse(is_quota_error("Connection reset by peer"))
+
+    def test_unknown_quota_loses_to_known_healthy_account(self):
+        add_account("unreadable", "/path/unreadable")
+        add_account("healthy", "/path/healthy")
+        usages = {
+            "/path/unreadable": None,
+            "/path/healthy": {
+                "gemini": {"5h": {"remaining_fraction": 0.6}, "weekly": {"remaining_fraction": 0.6}},
+            },
+        }
+        with patch.dict(os.environ, {"ANTIGRAVITY_ROTATION": "quota"}), \
+             patch("accounts.fetch_usage_for_home", side_effect=lambda h, cached=True: usages.get(h)):
+            chosen = pick_account(model="gemini-3.8-flash")
+        self.assertEqual(chosen["label"], "healthy")
+
+    def test_unknown_quota_still_selectable_when_alone(self):
+        add_account("only", "/path/only")
+        with patch.dict(os.environ, {"ANTIGRAVITY_ROTATION": "quota"}), \
+             patch("accounts.fetch_usage_for_home", return_value=None):
+            chosen = pick_account(model="gemini-3.8-flash")
+        self.assertIsNotNone(chosen)
+        self.assertEqual(chosen["label"], "only")
+
+    def test_malformed_quota_payload_is_unknown_not_fatal(self):
+        add_account("broken", "/path/broken")
+        add_account("healthy", "/path/healthy")
+        usages = {
+            "/path/broken": {"gemini": {"5h": {"remaining_fraction": "garbage"}, "weekly": {}}},
+            "/path/healthy": {
+                "gemini": {"5h": {"remaining_fraction": 0.9}, "weekly": {"remaining_fraction": 0.9}},
+            },
+        }
+        with patch.dict(os.environ, {"ANTIGRAVITY_ROTATION": "quota"}), \
+             patch("accounts.fetch_usage_for_home", side_effect=lambda h, cached=True: usages.get(h)):
+            chosen = pick_account(model="gemini-3.8-flash")
+        self.assertEqual(chosen["label"], "healthy")
+
+    def test_login_call_is_bounded_by_timeout(self):
+        with patch("sys.stdin.isatty", return_value=True):
+            def mock_run_side_effect(cmd, env=None, **kwargs):
+                create_mock_token_file(Path(env["HOME"]), email="bounded@test.com")
+                return SimpleNamespace(returncode=0)
+
+            with patch("subprocess.run", side_effect=mock_run_side_effect) as mock_run, \
+                 patch("__init__.resolve_agy_command", return_value="agy"), \
+                 patch("__init__.check_account_eligibility", return_value=(True, None)):
+                auth_handler("add", SimpleNamespace(label="bounded"))
+        kwargs = mock_run.call_args[1]
+        self.assertIn("timeout", kwargs)
+        self.assertGreater(kwargs["timeout"], 0)
+
+    def test_login_timeout_is_reported_and_registers_nothing(self):
+        with patch("sys.stdin.isatty", return_value=True):
+            with patch("subprocess.run", side_effect=subprocess.TimeoutExpired(cmd="agy", timeout=1)), \
+                 patch("__init__.resolve_agy_command", return_value="agy"):
+                with self.assertRaises(SystemExit) as ctx:
+                    auth_handler("add", SimpleNamespace(label="hangs"))
+        self.assertIn("did not finish", str(ctx.exception))
+        self.assertEqual(list_accounts(), [])
+
+    def test_logout_without_target_refuses_in_non_interactive_session(self):
+        add_account("acc1", "/path/1")
+        add_account("acc2", "/path/2")
+        with patch("sys.stdin.isatty", return_value=False):
+            with self.assertRaises(SystemExit) as ctx:
+                auth_handler("logout", SimpleNamespace(target=None))
+        self.assertIn("non-interactive", str(ctx.exception))
+        self.assertEqual(len(list_accounts()), 2)
+
+    def _stream_wrapper(self, chunks):
+        return _RotatingStreamWrapper(
+            client=SimpleNamespace(_execute_chat_completion=lambda **kw: iter([])),
+            resolved_model="gemini-3.8-flash",
+            effort=None,
+            messages_list=[],
+            effective_timeout=1.0,
+            tools=None,
+            tool_choice=None,
+            initial_account={"label": "acc_stream", "home_dir": "/path/stream"},
+            initial_stream=iter(chunks),
+            tried_labels={"acc_stream"},
+            lease_label="acc_stream",
+        )
+
+    def test_streamed_turn_holds_lease_until_exhausted(self):
+        acquire_lease("acc_stream")  # the caller acquires before spawning the turn
+        wrapper = self._stream_wrapper([1, 2, 3])
+        self.assertEqual(get_lease_count("acc_stream"), 1)
+        self.assertEqual(list(wrapper), [1, 2, 3])
+        self.assertEqual(get_lease_count("acc_stream"), 0)
+
+    def test_streamed_turn_releases_lease_on_close(self):
+        acquire_lease("acc_stream")
+        wrapper = self._stream_wrapper([1, 2, 3])
+        wrapper.close()
+        self.assertEqual(get_lease_count("acc_stream"), 0)
+
+    def test_streamed_turn_releases_lease_when_the_stream_raises(self):
+        def boom():
+            yield 1
+            raise RuntimeError("stream died")
+
+        acquire_lease("acc_stream")
+        wrapper = self._stream_wrapper(boom())
+        with self.assertRaises(RuntimeError):
+            list(wrapper)
+        self.assertEqual(get_lease_count("acc_stream"), 0)
+
+
 if __name__ == "__main__":
     unittest.main()
+
+
+class ServingAccountTests(unittest.TestCase):
+    def test_record_serving_account_round_trip_and_skips_unchanged_rewrites(self):
+        import accounts
+
+        add_account("work", "/path/work")
+        accounts._LAST_SERVING = None
+        with patch.object(accounts, "save_accounts", wraps=accounts.save_accounts) as save:
+            accounts.record_serving_account("work", model="m")
+            accounts.record_serving_account("work", model="m")
+            self.assertEqual(save.call_count, 1)
+            self.assertEqual(accounts.get_serving_account()["label"], "work")
+            accounts.record_serving_account(None, model="m")
+            self.assertEqual(save.call_count, 2)
+            self.assertIsNone(accounts.get_serving_account())
