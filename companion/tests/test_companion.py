@@ -215,3 +215,45 @@ def test_account_env_keeps_registered_account_tokens_out_of_the_keychain(tmp_pat
     assert env["HOME"] == str(tmp_path / "work")
     assert "SSH_CONNECTION" in env  # agy: file token storage, no keychain dialog
     assert "SSH_CONNECTION" not in accounts.account_env(Path.home())  # host keeps its keychain
+
+
+def _registry_env(tmp_path, monkeypatch, entries, **extra):
+    root = tmp_path / "accounts"
+    registry = tmp_path / "registry.json"
+    for entry in entries:
+        (root / entry["label"]).mkdir(parents=True)
+        entry["home_dir"] = str(root / entry["label"])
+    registry.write_text(json.dumps({"accounts": entries, **extra}))
+    monkeypatch.setenv("ANTIGRAVITY_ACCOUNTS_DIR", str(root))
+    monkeypatch.setenv("ANTIGRAVITY_ACCOUNTS_FILE", str(registry))
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    (tmp_path / "home" / ".Trash").mkdir(parents=True)
+    return root, registry
+
+
+def test_remove_unregisters_and_trashes_home(tmp_path, monkeypatch):
+    root, registry = _registry_env(
+        tmp_path, monkeypatch, [{"label": "bad"}, {"label": "good"}],
+        active_account="bad", serving={"label": "bad"},
+    )
+    removed, moved = accounts.remove_account("bad")
+    data = json.loads(registry.read_text())
+    assert removed is True
+    assert [e["label"] for e in data["accounts"]] == ["good"]
+    assert "active_account" not in data and "serving" not in data
+    assert not (root / "bad").exists() and moved.parent == tmp_path / "home" / ".Trash" and moved.is_dir()
+    assert [a["label"] for a in accounts.list_accounts()] == ["host", "good"]  # does not resurface via scan
+
+
+def test_remove_keep_home_leaves_directory(tmp_path, monkeypatch):
+    root, registry = _registry_env(tmp_path, monkeypatch, [{"label": "bad"}])
+    removed, moved = accounts.remove_account("bad", keep_home=True)
+    assert removed is True and moved is None and (root / "bad").is_dir()
+
+
+def test_remove_refuses_host(tmp_path, monkeypatch):
+    out = io.StringIO()
+    with patch("sys.stdout", out):
+        args = type("A", (), {"antigravity_action": "remove", "label": "host", "keep_home": False})()
+        assert antigravity_command(args) == 2
+    assert "cannot be removed" in out.getvalue()

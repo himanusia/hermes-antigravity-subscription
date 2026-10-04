@@ -18,6 +18,7 @@ import base64
 import json
 import os
 import re
+import shutil
 import subprocess
 import time
 from datetime import datetime, timezone
@@ -370,6 +371,54 @@ def set_active_label(label: str | None) -> dict[str, Any]:
         return data
 
     return save_registry(mutate)
+
+
+def remove_account(label: str, keep_home: bool = False) -> tuple[bool, Path | None]:
+    """Drop an account from the registry and move its HOME out of the accounts dir.
+
+    `list` also scans the accounts dir, so a registry-only removal would bring the
+    account back as unregistered. The HOME goes to the macOS Trash when there is one
+    (recoverable), otherwise it is deleted. Returns (registry entry removed, where
+    the HOME went or None when it was kept or absent).
+    """
+    wanted = (label or "").strip()
+    if not wanted or wanted == HOST_LABEL:
+        raise ValueError("the host account cannot be removed")
+    home = find_account_dir(wanted)
+    home_key = str(home.resolve()) if home is not None and home.exists() else ""
+    removed = False
+
+    def mutate(data: dict[str, Any]) -> dict[str, Any]:
+        nonlocal removed
+        kept = []
+        for entry in data.get("accounts") or []:
+            entry_home = str(entry.get("home_dir") or "")
+            matches = str(entry.get("label") or "") == wanted or (
+                home_key and entry_home and str(Path(entry_home).expanduser().resolve()) == home_key
+            )
+            if matches:
+                removed = True
+            else:
+                kept.append(entry)
+        data["accounts"] = kept
+        if data.get("active_account") == wanted:
+            data.pop("active_account", None)
+        if (data.get("serving") or {}).get("label") == wanted:
+            data.pop("serving", None)
+        return data
+
+    save_registry(mutate)
+
+    moved: Path | None = None
+    if not keep_home and home is not None and home.is_dir() and home.resolve() != Path.home().resolve():
+        trash = Path.home() / ".Trash"
+        if trash.is_dir():
+            moved = trash / f"agy-account-{home.name}-{int(time.time())}"
+            shutil.move(str(home), str(moved))
+        else:
+            shutil.rmtree(home)
+            moved = home
+    return removed, moved
 
 
 def save_rotation_mode(mode: str) -> dict[str, Any]:

@@ -40,6 +40,10 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
     p_add = subs.add_parser("add", help="Sign in a new Google account and register it")
     p_add.add_argument("--label", default="", help="Optional label (defaults to the account email)")
 
+    p_remove = subs.add_parser("remove", help="Unregister an account and move its home directory to the Trash")
+    p_remove.add_argument("label", help="Account label (see `hermes antigravity list`)")
+    p_remove.add_argument("--keep-home", action="store_true", help="Only unregister; leave the home directory on disk")
+
     p_mode = subs.add_parser("mode", help="Show or set the rotation mode")
     p_mode.add_argument(
         "mode",
@@ -57,7 +61,7 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
 def antigravity_command(args: argparse.Namespace) -> int:
     action = getattr(args, "antigravity_action", None)
     if not action:
-        print("Usage: hermes antigravity {list|run|usage|use|mode|ignite}")
+        print("Usage: hermes antigravity {list|run|usage|use|add|remove|mode|ignite}")
         return 2
     if action == "list":
         return _cmd_list(fast=bool(getattr(args, "fast", False)))
@@ -69,6 +73,8 @@ def antigravity_command(args: argparse.Namespace) -> int:
         return _cmd_use(str(getattr(args, "label", "")))
     if action == "add":
         return _cmd_add(str(getattr(args, "label", "") or ""))
+    if action == "remove":
+        return _cmd_remove(str(getattr(args, "label", "") or ""), bool(getattr(args, "keep_home", False)))
     if action == "mode":
         return _cmd_mode(str(getattr(args, "mode", "") or ""))
     if action == "ignite":
@@ -206,6 +212,27 @@ def _cmd_use(label: str) -> int:
         return _unknown_account(wanted)
     accounts.set_active_label(str(account["label"]))
     print(f"Active account: {account['label']}")
+    return 0
+
+
+def _cmd_remove(label: str, keep_home: bool) -> int:
+    wanted = (label or "").strip()
+    if not wanted:
+        print("Usage: hermes antigravity remove <label> [--keep-home]")
+        return 2
+    if wanted == accounts.HOST_LABEL:
+        print("The host account is your real HOME login and cannot be removed here.")
+        return 2
+    account = accounts.resolve_account(wanted)
+    if account is None:
+        return _unknown_account(wanted)
+    label = str(account["label"])
+    removed, moved = accounts.remove_account(label, keep_home=keep_home)
+    print(f"Removed '{label}' from the registry." if removed else f"'{label}' was not in the registry.")
+    if moved is not None:
+        print(f"Home directory moved to {moved}" if moved.exists() else f"Home directory deleted: {moved}")
+    elif keep_home:
+        print(f"Home directory kept at {account['home']} (`list` will still show it as unregistered).")
     return 0
 
 
