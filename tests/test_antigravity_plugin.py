@@ -755,6 +755,76 @@ class AntigravityPluginTests(unittest.TestCase):
             chunks = list(stream)
             mock_term.assert_called_once_with(mock_proc)
 
+    def _stream_with_steps(self, client, steps, messages):
+        fake_events = [json.dumps({"event": "init", "conversation_id": "img-conv"})] + [
+            json.dumps({"event": "step_update", "step_update": step}) for step in steps
+        ] + [json.dumps({"event": "result", "result": {"status": "SUCCESS", "response": "blue and yellow"}})]
+        mock_proc = MagicMock()
+        mock_proc.poll.return_value = None
+        mock_proc.stdout.readline.side_effect = [f"{line}\n" for line in fake_events] + [""]
+        mock_proc.stdin = MagicMock()
+        with patch("subprocess.Popen", return_value=mock_proc), patch.object(client, "_terminate_process") as term:
+            chunks = list(client.chat.completions.create(model="gemini-3.8-flash", messages=messages, stream=True))
+        return chunks, term, mock_proc
+
+    def test_attached_image_is_written_and_only_it_may_be_viewed(self):
+        import base64
+        from prompt import attached_image_paths, materialize_images
+
+        tmp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp_dir.cleanup)
+        blob = b"\x89PNG\r\n\x1a\nfake"
+        messages = [{"role": "user", "content": [
+            {"type": "text", "text": "what is this?"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64," + base64.b64encode(blob).decode()}},
+        ]}]
+        out = materialize_images(messages, tmp_dir.name)
+        self.assertIs(messages[0]["content"][1]["type"], "image_url")  # input untouched
+        paths = attached_image_paths(out)
+        self.assertEqual(len(paths), 1)
+        (path,) = paths
+        self.assertEqual(Path(path).read_bytes(), blob)
+        self.assertEqual(materialize_images(messages, tmp_dir.name), out)  # stable text for prefix reuse
+        # Anthropic-style blocks and plain messages pass through the same way.
+        anth = [{"role": "user", "content": [{"type": "image", "source": {
+            "type": "base64", "media_type": "image/jpeg", "data": base64.b64encode(blob).decode()}}]}]
+        self.assertTrue(next(iter(attached_image_paths(materialize_images(anth, tmp_dir.name)))).endswith(".jpg"))
+        self.assertEqual(materialize_images([{"role": "user", "content": "hi"}], tmp_dir.name),
+                         [{"role": "user", "content": "hi"}])
+
+    def test_stream_allows_viewing_the_attached_image(self):
+        import base64
+
+        tmp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp_dir.cleanup)
+        client = AntigravityClient(cwd=tmp_dir.name)
+        messages = [{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64," + base64.b64encode(b"img").decode()}},
+        ]}]
+        from prompt import attached_image_paths, materialize_images
+        (path,) = attached_image_paths(materialize_images(messages, tmp_dir.name))
+        view = {"step_type": "tool", "tool_name": "view_file", "tool_info": {"parameters": {"AbsolutePath": path}}}
+        chunks, term, _ = self._stream_with_steps(client, [view, {"step_type": "agent_response", "text_delta": "blue"}], messages)
+        term.assert_not_called()
+        self.assertIn("blue", "".join(ch.choices[0].delta.content or "" for ch in chunks if ch.choices))
+
+    def test_stream_still_neutralizes_other_native_tools_with_an_image_attached(self):
+        import base64
+
+        tmp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp_dir.cleanup)
+        messages = [{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64," + base64.b64encode(b"img").decode()}},
+        ]}]
+        for step in (
+            {"step_type": "tool", "tool_name": "view_file",
+             "tool_info": {"parameters": {"AbsolutePath": "/etc/passwd"}}},
+            {"step_type": "tool", "tool_name": "run_command", "tool_info": {"parameters": {"CommandLine": "ls"}}},
+        ):
+            client = AntigravityClient(cwd=tmp_dir.name)
+            _, term, proc = self._stream_with_steps(client, [step], messages)
+            term.assert_called_once_with(proc)
+
     def test_temp_directory_isolation_and_cleanup(self):
         client = AntigravityClient()
         temp_dir = client._cwd

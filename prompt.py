@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
+import hashlib
 import json
 import re
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Sequence
 
@@ -37,6 +41,101 @@ _PROMPT_PREAMBLE = (
 _TOOL_CALL_PREFIXES = tuple(
     "<tool_call>"[:i] for i in range(len("<tool_call>"), 0, -1)
 )
+
+
+_IMAGE_EXTENSIONS = {"image/png": ".png", "image/jpeg": ".jpg", "image/jpg": ".jpg", "image/gif": ".gif", "image/webp": ".webp"}
+_IMAGE_NOTE = (
+    "[Attached image: {path} -- this is part of the message. Open it with your view_file tool to see it; "
+    "viewing an attached image is the one allowed use of your native tools.]"
+)
+
+
+def _image_part_source(part: dict[str, Any]) -> tuple[str, str] | None:
+    """(kind, value) for an image content part: ("data", data-URL), ("path", file path) or ("url", URL)."""
+    kind = part.get("type")
+    if kind in ("image_url", "input_image"):
+        ref = part.get("image_url")
+        url = ref.get("url") if isinstance(ref, dict) else ref
+    elif kind == "image":  # Anthropic-style block
+        src = part.get("source") or {}
+        if src.get("type") == "base64":
+            url = f"data:{src.get('media_type') or 'image/png'};base64,{src.get('data') or ''}"
+        else:
+            url = src.get("url") or src.get("path")
+    else:
+        return None
+    url = str(url or "").strip()
+    if not url:
+        return None
+    if url.startswith("data:"):
+        return "data", url
+    if url.startswith("file://"):
+        return "path", url[len("file://"):]
+    if url.startswith("/"):
+        return "path", url
+    return "url", url
+
+
+def materialize_images(messages: list[dict[str, Any]], directory: str | Path) -> list[dict[str, Any]]:
+    """Replace image parts with a text note pointing at a file agy can open.
+
+    agy's stream-json input is text only, so image parts used to be dropped and
+    vision requests answered "I can't see an image". Inline (data:) images are
+    written to ``directory`` (agy's workspace) under a content hash, so the same
+    image always renders as the same text and the worker's history prefix match
+    still holds. Returns new message dicts; the input is not modified.
+    """
+    out: list[dict[str, Any]] = []
+    folder = Path(directory) / "attachments"
+    for msg in messages:
+        content = msg.get("content") if isinstance(msg, dict) else None
+        if not isinstance(content, list) or not any(
+            isinstance(p, dict) and _image_part_source(p) for p in content
+        ):
+            out.append(msg)
+            continue
+        parts: list[Any] = []
+        for part in content:
+            source = _image_part_source(part) if isinstance(part, dict) else None
+            if source is None:
+                parts.append(part)
+                continue
+            kind, value = source
+            if kind == "data":
+                header, _, payload = value.partition(",")
+                mime = header[len("data:"):].split(";")[0].lower() or "image/png"
+                try:
+                    blob = base64.b64decode(payload, validate=False)
+                except (binascii.Error, ValueError):
+                    parts.append({"type": "text", "text": "[Attached image could not be decoded.]"})
+                    continue
+                folder.mkdir(parents=True, exist_ok=True)
+                path = folder / (hashlib.sha256(blob).hexdigest()[:16] + _IMAGE_EXTENSIONS.get(mime, ".png"))
+                if not path.exists():
+                    path.write_bytes(blob)
+                parts.append({"type": "text", "text": _IMAGE_NOTE.format(path=path)})
+            elif kind == "path":
+                parts.append({"type": "text", "text": _IMAGE_NOTE.format(path=value)})
+            else:
+                parts.append({"type": "text", "text": f"[Attached image URL: {value}]"})
+        out.append({**msg, "content": parts})
+    return out
+
+
+_IMAGE_NOTE_PATH = re.compile(r"\[Attached image: (.+?) -- this is part of the message\.")
+
+
+def attached_image_paths(messages: list[dict[str, Any]]) -> frozenset[str]:
+    """Paths of the images `materialize_images` attached; agy may view exactly these."""
+    found: set[str] = set()
+    for msg in messages:
+        content = msg.get("content") if isinstance(msg, dict) else None
+        texts = [content] if isinstance(content, str) else [
+            p.get("text") for p in content or [] if isinstance(p, dict) and p.get("type") == "text"
+        ] if isinstance(content, list) else []
+        for text in texts:
+            found.update(_IMAGE_NOTE_PATH.findall(str(text or "")))
+    return frozenset(str(Path(p).resolve()) for p in found)
 
 
 def _render_message_content(content: Any) -> str:

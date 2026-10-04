@@ -48,6 +48,8 @@ try:
         _messages_match_prefix,
         _parse_tool_block,
         _render_message_content,
+        materialize_images,
+        attached_image_paths,
     )
     from .stream import AntigravityStream, collect_stream_completion
     from .accounts import (
@@ -98,6 +100,8 @@ except ImportError:
         _messages_match_prefix,
         _parse_tool_block,
         _render_message_content,
+        materialize_images,
+        attached_image_paths,
     )
     from stream import AntigravityStream, collect_stream_completion
     from accounts import (
@@ -859,6 +863,7 @@ class AntigravityClient:
             timeout=timeout,
             tools=tools,
             is_worker=False,
+            allowed_view_paths=attached_image_paths(messages),
         )
         if stream:
             return stream_iter
@@ -938,6 +943,7 @@ class AntigravityClient:
                     worker_lock_held=worker_acquired,
                     messages=messages_list,
                     usage_baseline=worker_usage_baseline,
+                    allowed_view_paths=attached_image_paths(messages_list),
                 )
                 if stream:
                     return stream_iter
@@ -987,7 +993,7 @@ class AntigravityClient:
 
         effort_param = reasoning_effort or extra_kwargs.get("reasoning_effort")
         resolved_model, effort = self._resolve_model_and_effort(model, effort_param)
-        messages_list = list(messages or [])
+        messages_list = materialize_images(list(messages or []), self._cwd)
         effective_timeout = (
             float(timeout)
             if isinstance(timeout, (int, float)) and timeout > 0

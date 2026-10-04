@@ -147,6 +147,7 @@ class AntigravityStream(Iterator[Any]):
         worker_lock_held: bool | None = None,
         messages: list[dict[str, Any]] | None = None,
         usage_baseline: dict[str, int] | None = None,
+        allowed_view_paths: frozenset[str] | None = None,
     ):
         # Loud pairing, not a defaulted bool (review nit): a future site
         # passing worker_lock WITHOUT worker_lock_held would silently never
@@ -165,6 +166,10 @@ class AntigravityStream(Iterator[Any]):
             )
         self.proc = proc
         self.client = client
+        # Images attached to the request (see prompt.materialize_images): agy may
+        # open exactly these with view_file. Every other native tool step is still
+        # neutralized.
+        self.allowed_view_paths = allowed_view_paths or frozenset()
         self.model = model
         self.timeout = timeout
         self.has_tools = bool(tools)
@@ -197,6 +202,17 @@ class AntigravityStream(Iterator[Any]):
         # __next__, so no idle thread outlives either end of life. See
         # __anext__ for why this is not the shared default executor.
         self._async_executor: ThreadPoolExecutor | None = None
+
+    def _is_attached_image_view(self, step: dict[str, Any]) -> bool:
+        """A view_file of an image this request attached: the one native tool step allowed."""
+        if step.get("tool_name") != "view_file" or not self.allowed_view_paths:
+            return False
+        params = (step.get("tool_info") or {}).get("parameters") or {}
+        path = str(params.get("AbsolutePath") or "")
+        try:
+            return bool(path) and str(Path(path).resolve()) in self.allowed_view_paths
+        except (OSError, ValueError):
+            return False
 
     def __iter__(self) -> "AntigravityStream":
         return self
@@ -565,6 +581,8 @@ class AntigravityStream(Iterator[Any]):
                     step = event.get("step_update", {})
                     if not self.conversation_id:
                         self.conversation_id = step.get("conversation_id", "")
+                    if step.get("step_type") == "tool" and self._is_attached_image_view(step):
+                        continue
                     if step.get("step_type") == "tool":
                         logger.warning(
                             "Antigravity attempted native tool invocation '%s'; neutralizing to prevent host execution.",
