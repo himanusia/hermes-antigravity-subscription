@@ -292,3 +292,15 @@ def test_table_fits_terminal_width():
         if width < 200:
             assert all(len(line) <= max(width, 25) for line in lines)
     assert "…" in out.getvalue()  # account clipped at 25 columns
+
+
+def test_account_process_ids_matches_home_exactly(tmp_path):
+    home = tmp_path / "acct"
+    listing = "\n".join([
+        f"  101 /usr/bin/agy --model x TERM=xterm HOME={home} SSH_CONNECTION=1",
+        f"  102 /usr/bin/agy HOME={home}-other",
+        "  103 /bin/zsh HOME=/Users/someone",
+        f"  104 language_server HOME={home}",
+    ])
+    with patch("accounts.subprocess.run", return_value=type("R", (), {"stdout": listing})()):
+        assert accounts.account_process_ids(home) == [101, 104]

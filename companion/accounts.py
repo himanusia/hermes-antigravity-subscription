@@ -20,6 +20,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import time
 from datetime import datetime, timezone
@@ -433,6 +434,54 @@ def set_active_label(label: str | None) -> dict[str, Any]:
         return data
 
     return save_registry(mutate)
+
+
+def account_process_ids(home: Path | str) -> list[int]:
+    """PIDs of processes running with HOME set to this account's directory.
+
+    A Hermes session that is still open keeps its agy worker for an account alive
+    after the account is removed; that worker refreshes the token and recreates the
+    account directory. `ps eww` lists each process's environment after its command.
+    """
+    target = "HOME=" + str(Path(home).expanduser())
+    try:
+        out = subprocess.run(["ps", "axeww", "-o", "pid=,command="], capture_output=True, text=True, timeout=10)
+    except Exception:
+        return []
+    pids = []
+    for line in (out.stdout or "").splitlines():
+        pid_text, _, command = line.strip().partition(" ")
+        if pid_text.isdigit() and target in command.split(" ") and int(pid_text) != os.getpid():
+            pids.append(int(pid_text))
+    return pids
+
+
+def stop_account_processes(home: Path | str, grace: float = 3.0) -> list[int]:
+    """Terminate (then kill) every process using this account's HOME. Returns their PIDs."""
+    pids = account_process_ids(home)
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+    deadline = time.time() + grace
+    while time.time() < deadline and any(_alive(pid) for pid in pids):
+        time.sleep(0.1)
+    for pid in pids:
+        if _alive(pid):
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+    return pids
+
+
+def _alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
 
 
 def remove_account(label: str, keep_home: bool = False) -> tuple[bool, Path | None]:

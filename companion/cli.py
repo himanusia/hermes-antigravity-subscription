@@ -236,9 +236,14 @@ def _cmd_remove(label: str, keep_home: bool) -> int:
     if account is None:
         return _unknown_account(wanted)
     label = str(account["label"])
+    # An open Hermes session may still run agy as this account; left alone it keeps
+    # refreshing the token and recreates the directory after it is moved away.
+    stopped = accounts.stop_account_processes(account["home"])
     removed, moved = accounts.remove_account(label, keep_home=keep_home)
     ref = _account_ref(account)
     print(f"Removed {ref} from the registry." if removed else f"{ref} was not in the registry.")
+    if stopped:
+        print(f"Stopped {len(stopped)} agy process(es) still using it: {', '.join(map(str, stopped))}")
     if moved is not None:
         print(f"Home directory moved to {moved}" if moved.exists() else f"Home directory deleted: {moved}")
     elif keep_home:
