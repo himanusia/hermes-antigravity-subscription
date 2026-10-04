@@ -54,8 +54,12 @@ try:
         clear_session_pin,
         fetch_usage_for_home,
         get_rotation_mode,
+        is_model_unavailable_error,
         is_quota_error,
         lease_account,
+        mark_model_unsupported,
+        model_support,
+        forget_model_listing,
         parse_reset_time,
         is_failover_enabled,
         has_registered_accounts,
@@ -98,8 +102,12 @@ except ImportError:
         clear_session_pin,
         fetch_usage_for_home,
         get_rotation_mode,
+        is_model_unavailable_error,
         is_quota_error,
         lease_account,
+        mark_model_unsupported,
+        model_support,
+        forget_model_listing,
         parse_reset_time,
         is_failover_enabled,
         has_registered_accounts,
@@ -281,6 +289,26 @@ def _log_rotation_failover(
     logger.warning("[agy-rotate] %s -> %s", prev_part, next_part)
 
 
+def _model_unavailable_here(account: dict[str, Any] | None, model: str | None, exc: Exception) -> bool:
+    """A registered account failed because it cannot serve ``model``; remember it.
+
+    The host default account (no label) is the last resort, so it is never routed
+    around. A bare BrokenPipe (agy exited before reading the prompt) says nothing
+    on its own, so the account's model listing is re-read to decide.
+    """
+    if not account or not str(account.get("label") or "").strip() or not model:
+        return False
+    if is_model_unavailable_error(exc):
+        mark_model_unsupported(account, model)
+        return True
+    if isinstance(exc, BrokenPipeError) or "process exited" in str(exc).lower():
+        forget_model_listing(account.get("home_dir"))
+        if model_support(account, model) is False:
+            mark_model_unsupported(account, model)
+            return True
+    return False
+
+
 def resolve_ambient_session_id(explicit: str | None = None) -> str | None:
     """Resolve the session id binding this client's calls to one rotation pin.
 
@@ -349,7 +377,10 @@ class _RotatingStreamWrapper:
         self.chunks_yielded = 0
 
     def _failover(self, exc: Exception) -> bool:
-        if self.chunks_yielded > 0 or not is_quota_error(exc) or len(self.tried_labels) >= self.max_attempts:
+        if self.chunks_yielded > 0 or len(self.tried_labels) >= self.max_attempts:
+            return False
+        model_gone = _model_unavailable_here(self.current_account, self.resolved_model, exc)
+        if not model_gone and not is_quota_error(exc):
             return False
 
         with contextlib.suppress(Exception):
@@ -358,7 +389,8 @@ class _RotatingStreamWrapper:
         # The host default account has no registry entry: nothing to cool down,
         # and no label to exclude.
         current_label = str(self.current_account.get("label") or "").strip()
-        if current_label:
+        if current_label and not model_gone:
+            # Lacking a model is not a quota problem: the account stays usable for others.
             cooldown_ts = _resolve_cooldown_reset(self.current_account, self.resolved_model)
             set_cooldown(current_label, until=cooldown_ts)
 
@@ -370,7 +402,10 @@ class _RotatingStreamWrapper:
         )
         _log_rotation_failover(self.current_account, next_acc, self.resolved_model)
         if not next_acc:
-            return False
+            if not model_gone:
+                return False
+            # No registered account serves the model: the host default account may.
+            next_acc = {"label": "", "home_dir": None}
 
         self.tried_labels.add(next_acc["label"])
         self.current_account = next_acc
@@ -1009,6 +1044,7 @@ class AntigravityClient:
                 )
         tried_labels: set[str] = set()
         last_exc: Exception | None = None
+        model_gone = False  # a registered account turned out not to serve the model
 
         for attempt in range(max_attempts):
             account = pick_account(
@@ -1017,7 +1053,7 @@ class AntigravityClient:
                 session_id=eff_session_id,
             )
             if not account:
-                if not tried_labels:
+                if not tried_labels or model_gone:
                     # Fail-open: no accounts configured or registry error
                     return self._execute_chat_completion(
                         resolved_model=resolved_model,
@@ -1038,17 +1074,23 @@ class AntigravityClient:
 
             if stream:
                 with lease_account(label):
-                    raw_stream = self._execute_chat_completion(
-                        resolved_model=resolved_model,
-                        effort=effort,
-                        messages_list=messages_list,
-                        effective_timeout=effective_timeout,
-                        tools=tools,
-                        tool_choice=tool_choice,
-                        stream=True,
-                        home_dir=home_dir,
-                        account_label=label,
-                    )
+                    try:
+                        raw_stream = self._execute_chat_completion(
+                            resolved_model=resolved_model,
+                            effort=effort,
+                            messages_list=messages_list,
+                            effective_timeout=effective_timeout,
+                            tools=tools,
+                            tool_choice=tool_choice,
+                            stream=True,
+                            home_dir=home_dir,
+                            account_label=label,
+                        )
+                    except Exception as exc:
+                        if not _model_unavailable_here(account, resolved_model, exc):
+                            raise
+                        last_exc, model_gone = exc, True
+                        continue
                     wrapper = _RotatingStreamWrapper(
                         client=self,
                         resolved_model=resolved_model,
@@ -1082,6 +1124,9 @@ class AntigravityClient:
                     update_last_used(label)
                     return res
             except Exception as exc:
+                if _model_unavailable_here(account, resolved_model, exc):
+                    last_exc, model_gone = exc, True
+                    continue
                 if is_quota_error(exc):
                     last_exc = exc
                     cooldown_ts = _resolve_cooldown_reset(account, resolved_model)
@@ -1095,5 +1140,15 @@ class AntigravityClient:
                     continue
                 raise
 
+        if model_gone:
+            return self._execute_chat_completion(
+                resolved_model=resolved_model,
+                effort=effort,
+                messages_list=messages_list,
+                effective_timeout=effective_timeout,
+                tools=tools,
+                tool_choice=tool_choice,
+                stream=stream,
+            )
         if last_exc:
             raise last_exc

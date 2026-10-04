@@ -35,4 +35,6 @@ def _no_real_agy_model_probe(monkeypatch):
     for name, mod in list(sys.modules.items()):
         if name.split(".")[-1] == "accounts" and hasattr(mod, "list_models_for_home"):
             monkeypatch.setattr(mod, "list_models_for_home", lambda home_dir, timeout=15.0: ())
+            if hasattr(mod, "_MODEL_DENIED"):
+                mod._MODEL_DENIED.clear()
     yield

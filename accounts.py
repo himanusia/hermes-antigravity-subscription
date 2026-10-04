@@ -927,32 +927,89 @@ def list_models_for_home(home_dir: str | None, timeout: float = 15.0) -> tuple[s
         if hit and now - hit[0] < (_MODELS_CACHE_TTL if hit[1] else _MODELS_FAILURE_TTL):
             return hit[1]
     models: tuple[str, ...] = ()
-    try:
-        env = probe_env(home_dir) if home_dir else apply_browser_block(dict(os.environ))
-        res = subprocess.run(
-            [resolve_agy_command(), "models"], env=env, capture_output=True, text=True, timeout=timeout,
-        )
-        models = tuple(dict.fromkeys(  # agy's own order, deduplicated
-            line.split()[0] for line in (res.stdout or "").splitlines()
-            if line.strip() and "fetching" not in line.lower()
-        ))
-    except Exception as exc:
-        logger.debug("agy models probe failed for %s: %s", home_dir or "host default", exc)
-    with _MODELS_CACHE_LOCK:  # empty = unknown; callers fail open on it
+    # One retry: a probe that races another agy start on the same HOME (token
+    # refresh, model cache rewrite) can come back empty although the account is fine.
+    for _ in range(2):
+        try:
+            env = probe_env(home_dir) if home_dir else apply_browser_block(dict(os.environ))
+            res = subprocess.run(
+                [resolve_agy_command(), "models"], env=env, capture_output=True, text=True, timeout=timeout,
+            )
+            models = tuple(dict.fromkeys(  # agy's own order, deduplicated
+                line.split()[0] for line in (res.stdout or "").splitlines()
+                if line.strip() and "fetching" not in line.lower()
+            ))
+        except Exception as exc:
+            logger.debug("agy models probe failed for %s: %s", home_dir or "host default", exc)
+        if models:
+            break
+    if not models:
+        logger.warning("agy models probe returned nothing for %s; model routing treats it as unknown",
+                       home_dir or "host default")
+    with _MODELS_CACHE_LOCK:  # empty = unknown
         _MODELS_CACHE[key] = (now, models)
     return models
 
 
-def account_supports_model(acc: dict[str, Any], model: str | None) -> bool:
-    """Whether the account lists ``model`` (exact id or an effort variant). Unknown: True."""
+def forget_model_listing(home_dir: str | None) -> None:
+    """Drop the cached `agy models` listing so the next lookup probes again."""
+    with _MODELS_CACHE_LOCK:
+        _MODELS_CACHE.pop(str(home_dir or ""), None)
+
+
+# (home, model) pairs a request proved unservable ("invalid model selection" or a
+# 404 from the backend). Kept as long as a good listing, so one failed turn keeps
+# that account out of the route for this model even when its listing is unknown.
+_MODEL_DENIED: dict[tuple[str, str], float] = {}
+
+_MODEL_UNAVAILABLE_MARKERS = (
+    "invalid model selection",
+    "is not recognized as a known model",
+    "not_found (code 404)",
+    "requested entity was not found",
+)
+
+
+def is_model_unavailable_error(error: Exception | str) -> bool:
+    """The account cannot serve the requested model (as opposed to quota or transport)."""
+    msg = str(error).lower()
+    return any(marker in msg for marker in _MODEL_UNAVAILABLE_MARKERS)
+
+
+def mark_model_unsupported(acc: dict[str, Any] | None, model: str | None) -> None:
+    """Remember that ``acc`` failed to serve ``model`` so routing skips it."""
+    if not acc or not model or not acc.get("home_dir"):
+        return
+    key = (str(Path(acc["home_dir"]).expanduser()), model.lower())
+    with _MODELS_CACHE_LOCK:
+        _MODEL_DENIED[key] = time.time()
+    logger.warning("[agy-rotate] %s cannot serve %s; routing around it", acc.get("label") or "?", model)
+
+
+def model_support(acc: dict[str, Any] | None, model: str | None, timeout: float = 8.0) -> bool | None:
+    """True / False when known, None when the account's listing is unknown.
+
+    ``acc=None`` is the host default account.
+    """
     if not model:
         return True
-    # Runs on the request path: bound the probe tighter than the picker's listing.
-    models = list_models_for_home(acc.get("home_dir") or None, timeout=8.0)
-    if not models:
-        return True  # probe failed: fail open rather than strand the request
     m = model.lower()
+    home = (acc or {}).get("home_dir") or None
+    if home:
+        with _MODELS_CACHE_LOCK:
+            denied_at = _MODEL_DENIED.get((str(Path(home).expanduser()), m))
+        if denied_at and time.time() - denied_at < _MODELS_CACHE_TTL:
+            return False
+    models = list_models_for_home(home, timeout=timeout)
+    if not models:
+        return None
     return any(x.lower() == m or x.lower().startswith(m + "-") for x in models)
+
+
+def account_supports_model(acc: dict[str, Any], model: str | None) -> bool:
+    """Whether the account lists ``model`` (exact id or an effort variant). Unknown: True."""
+    # Runs on the request path: bound the probe tighter than the picker's listing.
+    return model_support(acc, model, timeout=8.0) is not False
 
 
 def pick_account(
@@ -997,13 +1054,21 @@ def pick_account(
         }
 
         excluded = set(exclude_labels or [])
-        # An account without the model makes agy exit on --model (BrokenPipe, then
-        # fallback provider). Skip it; with none left the request goes to the host
-        # default account, which may have the model.
-        excluded.update(
-            str(acc.get("label", "") or "") for acc in accounts
-            if not account_supports_model(acc, model)
-        )
+        # An account without the model makes agy exit on --model (BrokenPipe) or the
+        # backend answer 404, and Hermes then degrades to its fallback provider. Skip
+        # it; with none left the request goes to the host default account. An
+        # account whose listing is unknown is only used when nothing is known to
+        # serve the model: a failed probe must not route a request onto an account
+        # that may lack it while a known-good one (or the host) is available.
+        support = {
+            str(acc.get("label", "") or ""): model_support(acc, model)
+            for acc in accounts
+            if str(acc.get("label", "") or "") not in excluded
+        }
+        excluded.update(label for label, ok in support.items() if ok is False)
+        if model and any(ok is None for ok in support.values()):
+            if any(ok is True for ok in support.values()) or model_support(None, model) is True:
+                excluded.update(label for label, ok in support.items() if ok is None)
         if session_id and not _is_session_stickiness_enabled():
             session_id = None  # stickiness disabled for this call
 
