@@ -128,7 +128,7 @@ def _cmd_list(fast: bool) -> int:
                 f"{mark}{account_id if account_id is not None else '-'}",
                 label,
                 # The label is usually the email itself; do not print it twice.
-                "" if email == label else (email or "-"),
+                "" if email in ("", label) else email,
                 eligible_text,
                 quota_gemini,
                 quota_claude,
