@@ -148,6 +148,7 @@ def _cmd_list(fast: bool) -> int:
     print("Switch account:   hermes antigravity use <account>")
     print("Rotation:         hermes antigravity mode [mode]     # off | quota | round_robin | fixed")
     print("Idle wake-up:     hermes antigravity ignite [on|off]")
+    print("Remove account:   hermes antigravity remove <account> [--keep-home]")
     return 0
 
 
