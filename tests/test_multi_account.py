@@ -292,6 +292,135 @@ class TestMultiAccount(unittest.TestCase):
             # No rotation account has it: fail open to the host default account.
             self.assertIsNone(pick_account(model="claude-opus-5-5-high"))
 
+    def test_pick_account_avoids_unknown_listing_when_another_account_has_the_model(self):
+        # 2026-10-04: yazid's `agy models` probe came back empty (unknown) while
+        # shinti listed Sonnet 5.5. Failing open routed Sonnet 5.5 onto yazid,
+        # which lacks it (404 / BrokenPipe), and Hermes fell back to DeepSeek.
+        add_account("yazid", "/path/yazid")
+        add_account("shinti", "/path/shinti")
+        listing = {str(Path("/path/shinti").resolve()): ("claude-sonnet-5-5-medium",)}
+
+        def fake_models(home, timeout=15.0):
+            return listing.get(str(Path(home).resolve()), ()) if home else ()
+
+        with patch("accounts.list_models_for_home", side_effect=fake_models), \
+                patch("accounts.fetch_usage_for_home", return_value=None), \
+                patch.dict(os.environ, {"ANTIGRAVITY_ROTATION": "round_robin"}):
+            for _ in range(3):
+                self.assertEqual(pick_account(model="claude-sonnet-5-5-medium")["label"], "shinti")
+
+    def test_pick_account_prefers_host_over_unknown_listing(self):
+        add_account("yazid", "/path/yazid")
+
+        def fake_models(home, timeout=15.0):
+            return () if home else ("claude-sonnet-5-5-medium",)
+
+        with patch("accounts.list_models_for_home", side_effect=fake_models), \
+                patch("accounts.fetch_usage_for_home", return_value=None), \
+                patch.dict(os.environ, {"ANTIGRAVITY_ROTATION": "round_robin"}):
+            self.assertIsNone(pick_account(model="claude-sonnet-5-5-medium"))  # host default
+            # Nothing known anywhere: keep failing open rather than stranding it.
+            self.assertEqual(pick_account(model="gemini-3.8-flash")["label"], "yazid")
+
+    def test_mark_model_unsupported_routes_around_the_account(self):
+        import accounts as accounts_mod
+
+        add_account("yazid", "/path/yazid")
+        add_account("shinti", "/path/shinti")
+        accounts_mod.mark_model_unsupported({"label": "yazid", "home_dir": "/path/yazid"}, "claude-sonnet-5-5-medium")
+        with patch("accounts.fetch_usage_for_home", return_value=None), \
+                patch.dict(os.environ, {"ANTIGRAVITY_ROTATION": "round_robin"}):
+            for _ in range(3):
+                self.assertEqual(pick_account(model="claude-sonnet-5-5-medium")["label"], "shinti")
+            # Only that model: the account still serves the rest.
+            labels = {pick_account(model="gemini-3.8-flash")["label"] for _ in range(4)}
+            self.assertIn("yazid", labels)
+
+    def test_is_model_unavailable_error(self):
+        from accounts import is_model_unavailable_error
+
+        self.assertTrue(is_model_unavailable_error(
+            "Antigravity model error: NOT_FOUND (code 404): Requested entity was not found."))
+        self.assertTrue(is_model_unavailable_error(
+            'invalid model selection (--model "claude-sonnet-5-5-medium" --effort ""): model '
+            'claude-sonnet-5-5-medium is not recognized as a known model'))
+        self.assertFalse(is_model_unavailable_error("RESOURCE_EXHAUSTED (code 429)"))
+
+    def test_client_routes_off_an_account_that_lacks_the_model(self):
+        add_account("yazid", "/path/yazid")
+        add_account("shinti", "/path/shinti")
+        tmp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp_dir.cleanup)
+        client = AntigravityClient(cwd=tmp_dir.name)
+        served = []
+
+        class NotFoundStream:
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                raise RuntimeError("Antigravity model error: NOT_FOUND (code 404): Requested entity was not found.")
+
+            def close(self):
+                pass
+
+        def mock_execute(*args, **kwargs):
+            served.append(kwargs.get("account_label"))
+            if kwargs.get("account_label") == "yazid":
+                return NotFoundStream()
+            return iter([SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace(content="ok"))])])
+
+        with patch.object(client, "_execute_chat_completion", side_effect=mock_execute), \
+                patch("client.is_authenticated", return_value=True), \
+                patch("accounts.fetch_usage_for_home", return_value=None), \
+                patch.dict(os.environ, {"ANTIGRAVITY_ROTATION": "round_robin"}):
+            update_last_used("shinti")  # round robin starts on yazid
+            chunks = list(client.chat.completions.create(
+                model="claude-sonnet-5-5-medium", messages=[{"role": "user", "content": "hi"}], stream=True,
+            ))
+        self.assertEqual(chunks[0].choices[0].delta.content, "ok")
+        self.assertEqual(served, ["yazid", "shinti"])
+        accounts = {a["label"]: a for a in list_accounts()}
+        self.assertEqual(accounts["yazid"].get("cooldown_until", 0.0), 0.0)  # not a quota problem
+
+    def test_client_falls_back_to_host_when_no_account_has_the_model(self):
+        add_account("yazid", "/path/yazid")
+        tmp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp_dir.cleanup)
+        client = AntigravityClient(cwd=tmp_dir.name)
+        served = []
+
+        def mock_execute(*args, **kwargs):
+            served.append(kwargs.get("home_dir"))
+            if kwargs.get("account_label") == "yazid":
+                raise BrokenPipeError(32, "Broken pipe")
+            return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="host-ok"))])
+
+        def fake_models(home, timeout=15.0):
+            return ("claude-sonnet-4-6",) if home else ("claude-sonnet-5-5-medium",)
+
+        with patch.object(client, "_execute_chat_completion", side_effect=mock_execute), \
+                patch("client.is_authenticated", return_value=True), \
+                patch("accounts.fetch_usage_for_home", return_value=None), \
+                patch.dict(os.environ, {"ANTIGRAVITY_ROTATION": "round_robin"}):
+            # The picker still thinks yazid is fine (stale unknown listing) ...
+            with patch("accounts.model_support", return_value=None):
+                first = pick_account(model="claude-sonnet-5-5-medium")
+            self.assertEqual(first["label"], "yazid")
+            # ... so make the client meet it: listing known only after the failure.
+            calls = {"n": 0}
+
+            def listing_after_failure(home, timeout=15.0):
+                calls["n"] += 1
+                return fake_models(home) if served else ()
+
+            with patch("accounts.list_models_for_home", side_effect=listing_after_failure):
+                res = client.chat.completions.create(
+                    model="claude-sonnet-5-5-medium", messages=[{"role": "user", "content": "hi"}], stream=False,
+                )
+        self.assertEqual(res.choices[0].message.content, "host-ok")
+        self.assertEqual(served, ["/path/yazid", None])
+
     def test_pick_account_skips_cooldown(self):
         add_account("acc1", "/path/1")
         add_account("acc2", "/path/2")
