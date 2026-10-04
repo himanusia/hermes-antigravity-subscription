@@ -257,3 +257,38 @@ def test_remove_refuses_host(tmp_path, monkeypatch):
         args = type("A", (), {"antigravity_action": "remove", "label": "host", "keep_home": False})()
         assert antigravity_command(args) == 2
     assert "cannot be removed" in out.getvalue()
+
+
+def test_ids_are_stable_and_never_reused(tmp_path, monkeypatch):
+    _registry_env(tmp_path, monkeypatch, [{"label": "a"}, {"label": "b"}, {"label": "c"}])
+    listed = {a["label"]: a["id"] for a in accounts.list_accounts()}
+    assert listed == {"host": 0, "a": 1, "b": 2, "c": 3}
+    accounts.remove_account("b")
+    (tmp_path / "accounts" / "d").mkdir()
+    accounts.save_registry(lambda d: {**d, "accounts": d["accounts"] + [{"label": "d", "home_dir": str(tmp_path / "accounts" / "d")}]})
+    listed = {a["label"]: a["id"] for a in accounts.list_accounts()}
+    assert listed == {"host": 0, "a": 1, "c": 3, "d": 4}  # 2 stays retired
+
+
+def test_resolve_account_by_id(tmp_path, monkeypatch):
+    _registry_env(tmp_path, monkeypatch, [{"label": "a@x.com"}, {"label": "b@x.com"}])
+    assert accounts.resolve_account("2")["label"] == "b@x.com"
+    assert accounts.resolve_account("#1")["label"] == "a@x.com"
+    assert accounts.resolve_account("0")["host"] is True
+    assert accounts.resolve_account("9") is None
+
+
+def test_table_fits_terminal_width():
+    from cli import _print_table
+
+    rows = [["ID", "ACCOUNT", "STATUS", "HOME"], ["1", "someone.long@example.com", "yes", "~/someone.long-example.com"]]
+    fit = (("drop", "HOME"), ("shrink", "ACCOUNT"))
+    for width, expect_home in ((200, True), (40, False), (25, False)):
+        out = io.StringIO()
+        with patch("sys.stdout", out):
+            _print_table(rows, fit=fit, width=width)
+        lines = out.getvalue().splitlines()
+        assert ("HOME" in lines[0]) is expect_home
+        if width < 200:
+            assert all(len(line) <= max(width, 25) for line in lines)
+    assert "…" in out.getvalue()  # account clipped at 25 columns

@@ -15,6 +15,7 @@ Contract read here:
 from __future__ import annotations
 
 import base64
+import contextlib
 import json
 import os
 import re
@@ -28,6 +29,7 @@ from typing import Any
 TOKEN_FILENAMES = ("jetski-standalone-oauth-token", "antigravity-oauth-token")
 QUOTA_TIMEOUT_S = 45
 HOST_LABEL = "host"
+HOST_ID = 0
 BINARY_ENV_VARS = ("ANTIGRAVITY_COMMAND", "AGY_CLI_PATH", "ANTIGRAVITY_CLI_PATH")
 ROTATION_MODES = ("off", "quota", "round_robin", "fixed")
 
@@ -93,10 +95,19 @@ def registry_accounts() -> list[dict[str, Any]]:
 
 
 def list_accounts(include_scan: bool = True) -> list[dict[str, Any]]:
-    """Host account first, then registry entries, then any extra account dirs on disk."""
+    """Host account first, then registry entries, then any extra account dirs on disk.
+
+    Every account carries an `id`: 0 for host, the registry's stable number for a
+    registered account, None for an unregistered dir found on disk.
+    """
+    try:
+        ensure_ids()
+    except Exception:
+        pass  # read-only registry: entries simply show without an id
     seen_homes: set[str] = set()
     accounts: list[dict[str, Any]] = [
         {
+            "id": HOST_ID,
             "label": HOST_LABEL,
             "home": Path.home(),
             "email": "",
@@ -118,6 +129,7 @@ def list_accounts(include_scan: bool = True) -> list[dict[str, Any]]:
         seen_homes.add(key)
         accounts.append(
             {
+                "id": entry.get("id") if isinstance(entry.get("id"), int) else None,
                 "label": str(entry.get("label") or home.name),
                 "home": home,
                 "email": str(entry.get("email") or "") or email_from_token(token_path_for(home)),
@@ -137,6 +149,7 @@ def list_accounts(include_scan: bool = True) -> list[dict[str, Any]]:
             seen_homes.add(key)
             accounts.append(
                 {
+                    "id": None,
                     "label": child.name,
                     "home": child,
                     "email": email_from_token(token_path_for(child)),
@@ -152,7 +165,13 @@ def resolve_account(label: str) -> dict[str, Any] | None:
     wanted = (label or "").strip()
     if not wanted:
         return None
-    for account in list_accounts():
+    listed = list_accounts()
+    number = wanted[1:] if wanted.startswith("#") else wanted
+    if number.isdigit():
+        for account in listed:
+            if account.get("id") == int(number):
+                return account
+    for account in listed:
         if account["label"] == wanted or account["home"].name == wanted:
             return account
     return None
@@ -336,19 +355,62 @@ def find_account_dir(label: str) -> Path | None:
     return None
 
 
+@contextlib.contextmanager
+def _registry_lock(path: Path):
+    """The provider's lock file (`<registry>.lock`), so the two never interleave writes."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path.with_suffix(".lock"), "a") as handle:
+        try:
+            import fcntl
+        except ImportError:  # Windows: best effort, no lock
+            yield
+            return
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
 def save_registry(mutator) -> dict[str, Any]:
     """Read-modify-write the registry through `mutator(data) -> data`, preserving unknown fields."""
     path = registry_file()
-    data = load_registry()
-    updated = mutator(data)
-    if not isinstance(updated, dict):
-        updated = data
-    path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        path.write_text(json.dumps(updated, indent=2, sort_keys=True))
-    except Exception as exc:
-        raise RuntimeError(f"cannot write registry {path}: {exc}") from exc
+    with _registry_lock(path):
+        data = load_registry()
+        updated = mutator(data)
+        if not isinstance(updated, dict):
+            updated = data
+        tmp = path.with_suffix(".tmp")
+        try:
+            tmp.write_text(json.dumps(updated, indent=2, sort_keys=True))
+            tmp.chmod(0o600)
+            tmp.replace(path)
+        except Exception as exc:
+            raise RuntimeError(f"cannot write registry {path}: {exc}") from exc
     return updated
+
+
+def ensure_ids() -> None:
+    """Give every registry entry a stable numeric `id` (1, 2, ...; 0 is host).
+
+    Numbers are never reused (`next_account_id` only grows), so an id still names
+    the same account after another one is removed. Writes only when one is missing.
+    """
+    if all(isinstance(entry.get("id"), int) for entry in registry_accounts()):
+        return
+
+    def mutate(data: dict[str, Any]) -> dict[str, Any]:
+        entries = [entry for entry in data.get("accounts") or [] if isinstance(entry, dict)]
+        taken = [entry["id"] for entry in entries if isinstance(entry.get("id"), int)]
+        next_id = max([HOST_ID, *taken, int(data.get("next_account_id") or 1) - 1]) + 1
+        for entry in entries:
+            if not isinstance(entry.get("id"), int):
+                entry["id"] = next_id
+                next_id += 1
+        data["next_account_id"] = next_id
+        return data
+
+    save_registry(mutate)
 
 
 def set_active_label(label: str | None) -> dict[str, Any]:

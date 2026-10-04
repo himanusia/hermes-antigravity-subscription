@@ -34,7 +34,11 @@ hermes antigravity mode [mode]       # show or set rotation: off | quota | round
 hermes antigravity ignite [on|off]   # opt-in: wake the 5h window on an idle account
 ```
 
-`host` is the original HOME account. Other accounts are read from
+`<account>` is the ID shown by `list` (e.g. `3`) or the label. `host` is ID 0,
+the original HOME account. Registered accounts get a stable ID in the registry
+(`id`, with `next_account_id`); an ID is never reused after its account is removed.
+`list` fits the terminal width: it drops HOME, then EMAIL, then clips long
+account names. Other accounts are read from
 `~/.agy-accounts/<label>/` plus the registry at
 `~/.hermes/antigravity-accounts.json` (override with `ANTIGRAVITY_ACCOUNTS_DIR`
 and `ANTIGRAVITY_ACCOUNTS_FILE`).

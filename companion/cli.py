@@ -28,20 +28,20 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
     p_list.add_argument("--fast", action="store_true", help="Skip quota probes (no agy calls)")
 
     p_run = subs.add_parser("run", help="Run the agy CLI as a stored account (interactive by default)")
-    p_run.add_argument("label", help="Account label, or 'host' for the original HOME")
+    p_run.add_argument("label", help="Account ID or label, or 'host' for the original HOME")
     p_run.add_argument("agy_args", nargs=argparse.REMAINDER, help="Arguments passed through to agy")
 
     p_usage = subs.add_parser("usage", help="Show remaining quota for one account")
-    p_usage.add_argument("label", nargs="?", default=accounts.HOST_LABEL, help="Account label (default: host)")
+    p_usage.add_argument("label", nargs="?", default=accounts.HOST_LABEL, help="Account ID or label (default: host)")
 
     p_use = subs.add_parser("use", help="Switch the active account in the registry")
-    p_use.add_argument("label", help="Account label, or 'host' to return to the host default")
+    p_use.add_argument("label", help="Account ID or label, or 'host' to return to the host default")
 
     p_add = subs.add_parser("add", help="Sign in a new Google account and register it")
     p_add.add_argument("--label", default="", help="Optional label (defaults to the account email)")
 
     p_remove = subs.add_parser("remove", help="Unregister an account and move its home directory to the Trash")
-    p_remove.add_argument("label", help="Account label (see `hermes antigravity list`)")
+    p_remove.add_argument("label", help="Account ID or label (see `hermes antigravity list`)")
     p_remove.add_argument("--keep-home", action="store_true", help="Only unregister; leave the home directory on disk")
 
     p_mode = subs.add_parser("mode", help="Show or set the rotation mode")
@@ -85,7 +85,7 @@ def antigravity_command(args: argparse.Namespace) -> int:
 
 def _cmd_list(fast: bool) -> int:
     active = accounts.active_store_name()
-    header: list[str] = ["ACCOUNT", "EMAIL", "ELIGIBLE", "GEMINI 5h/wk", "CLAUDE+GPT 5h/wk", "RESET", "HOME"]
+    header: list[str] = ["ID", "ACCOUNT", "EMAIL", "ELIGIBLE", "GEMINI 5h/wk", "CLAUDE+GPT 5h/wk", "RESET", "HOME"]
     rows: list[list[str]] = [header]
     ineligible: list[str] = []
 
@@ -101,32 +101,34 @@ def _cmd_list(fast: bool) -> int:
             eligible_value = account.get("eligible")
             if eligible_value is False:
                 eligible_text = "NO"
-                ineligible.append(str(account["label"]))
+                ineligible.append(_account_ref(account))
             elif eligible_value is True:
                 eligible_text = "yes"
             else:
                 eligible_text = "-"
-            gemini = claude = reset_text = "-"
-            quota_gemini = quota_claude = "-"
+            quota_gemini = quota_claude = reset_text = "-"
         else:
             eligible, windows, note, resets = accounts.probe(account["home"])
             if eligible is True:
                 eligible_text = "yes"
             elif eligible is False:
                 eligible_text = "NO"
-                ineligible.append(str(account["label"]))
+                ineligible.append(_account_ref(account))
             else:
                 eligible_text = f"? ({note})" if note else "?"
-            gemini = accounts.window_pair(windows, "gemini")
-            claude = accounts.window_pair(windows, "claude_gpt")
             quota_gemini = accounts.window_pair(windows, "gemini")
             quota_claude = accounts.window_pair(windows, "claude_gpt")
             reset_text = accounts.next_reset(resets)
         mark = "*" if is_active else " "
+        account_id = account.get("id")
+        label = str(account["label"])
+        email = str(account["email"] or "")
         rows.append(
             [
-                f"{mark} {account['label']}",
-                str(account["email"] or "-"),
+                f"{mark}{account_id if account_id is not None else '-'}",
+                label,
+                # The label is usually the email itself; do not print it twice.
+                "" if email == label else (email or "-"),
                 eligible_text,
                 quota_gemini,
                 quota_claude,
@@ -135,13 +137,19 @@ def _cmd_list(fast: bool) -> int:
             ]
         )
 
-    _print_table(rows)
+    if all(not row[2] for row in rows[1:]):
+        rows = [row[:2] + row[3:] for row in rows]
+    _print_table(
+        rows,
+        fit=(("drop", "HOME"), ("shrink", "EMAIL"), ("drop", "EMAIL"), ("shrink", "ACCOUNT"), ("drop", "RESET")),
+    )
 
     # Warn only about accounts that cannot be used; eligible accounts stay quiet.
     if ineligible:
         print(f"\nWARNING: not eligible for Antigravity (skipped by quota rotation): {', '.join(ineligible)}")
 
-    print("\nRun an account:   hermes antigravity run <account>")
+    print("\n<account> is an ID (e.g. 3) or a label.")
+    print("Run an account:   hermes antigravity run <account>")
     print("Add an account:   hermes antigravity add [--label <name>]")
     print("One-shot:         hermes antigravity run <account> -p \"...\"")
     print("Quota:            hermes antigravity usage [account]")
@@ -197,7 +205,7 @@ def _cmd_usage(label: str) -> int:
 def _cmd_use(label: str) -> int:
     wanted = (label or "").strip()
     if not wanted:
-        print("Usage: hermes antigravity use <label>   ('host' returns to the host default)")
+        print("Usage: hermes antigravity use <id|label>   ('host' returns to the host default)")
         return 2
     if wanted == accounts.HOST_LABEL:
         accounts.set_active_label(None)
@@ -219,7 +227,7 @@ def _cmd_use(label: str) -> int:
 def _cmd_remove(label: str, keep_home: bool) -> int:
     wanted = (label or "").strip()
     if not wanted:
-        print("Usage: hermes antigravity remove <label> [--keep-home]")
+        print("Usage: hermes antigravity remove <id|label> [--keep-home]")
         return 2
     if wanted == accounts.HOST_LABEL:
         print("The host account is your real HOME login and cannot be removed here.")
@@ -229,7 +237,8 @@ def _cmd_remove(label: str, keep_home: bool) -> int:
         return _unknown_account(wanted)
     label = str(account["label"])
     removed, moved = accounts.remove_account(label, keep_home=keep_home)
-    print(f"Removed '{label}' from the registry." if removed else f"'{label}' was not in the registry.")
+    ref = _account_ref(account)
+    print(f"Removed {ref} from the registry." if removed else f"{ref} was not in the registry.")
     if moved is not None:
         print(f"Home directory moved to {moved}" if moved.exists() else f"Home directory deleted: {moved}")
     elif keep_home:
@@ -299,14 +308,53 @@ def _cmd_ignite(state: str) -> int:
     return 0
 
 
-def _print_table(rows: list[list[str]]) -> None:
+def _account_ref(account: dict) -> str:
+    account_id = account.get("id")
+    return f"#{account_id} {account['label']}" if account_id is not None else str(account["label"])
+
+
+def _clip(text: str, width: int) -> str:
+    return text if len(text) <= width else text[: max(width - 1, 0)] + "…"
+
+
+def _print_table(
+    rows: list[list[str]],
+    fit: tuple[tuple[str, str], ...] = (),
+    width: int | None = None,
+) -> None:
+    """Print rows as columns that fit the terminal.
+
+    `fit` lists ("drop", header) / ("shrink", header) steps, applied in order only
+    while the table is still too wide; "shrink" clips a column (with an ellipsis)
+    down to 12 characters. A pipe or file (no terminal) gets the full table.
+    """
     if not rows:
         return
-    widths = [max(len(row[index]) for row in rows) for index in range(len(rows[0]))]
+    gap = 2
+    if width is None:
+        width = shutil.get_terminal_size((0, 0)).columns if sys.stdout.isatty() else 0
+    rows = [list(row) for row in rows]
+    widths = [max(len(row[i]) for row in rows) for i in range(len(rows[0]))]
+
+    def over() -> int:
+        return sum(widths) + gap * (len(widths) - 1) - width
+
+    for step, name in fit if width > 0 else ():
+        if over() <= 0:
+            break
+        if name not in rows[0]:
+            continue
+        index = rows[0].index(name)
+        if step == "drop":
+            rows = [row[:index] + row[index + 1 :] for row in rows]
+            del widths[index]
+        else:
+            widths[index] -= min(over(), max(widths[index] - max(12, len(name)), 0))
+
     for index, row in enumerate(rows):
-        print("  ".join(cell.ljust(widths[i]) for i, cell in enumerate(row)).rstrip())
+        print("  ".join(_clip(cell, widths[i]).ljust(widths[i]) for i, cell in enumerate(row)).rstrip())
         if index == 0:
-            print("  ".join("-" * width for width in widths))
+            print("  ".join("-" * w for w in widths))
 
 
 def main(argv: list[str] | None = None) -> int:
