@@ -987,8 +987,9 @@ def forget_model_listing(home_dir: str | None) -> None:
 # that account out of the route for this model even when its listing is unknown.
 _MODEL_DENIED: dict[tuple[str, str], float] = {}
 
+# Not the bare "invalid model selection": agy also says that for a bad --effort,
+# which every account rejects alike.
 _MODEL_UNAVAILABLE_MARKERS = (
-    "invalid model selection",
     "is not recognized as a known model",
     "not_found (code 404)",
     "requested entity was not found",

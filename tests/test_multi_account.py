@@ -345,6 +345,9 @@ class TestMultiAccount(unittest.TestCase):
             'invalid model selection (--model "claude-sonnet-5-5-medium" --effort ""): model '
             'claude-sonnet-5-5-medium is not recognized as a known model'))
         self.assertFalse(is_model_unavailable_error("RESOURCE_EXHAUSTED (code 429)"))
+        self.assertFalse(is_model_unavailable_error(
+            'invalid model selection (--model "claude-sonnet-5-5" --effort ""): '
+            '--model claude-sonnet-5-5 requires --effort (available: low, medium, high)'))
 
     def test_client_routes_off_an_account_that_lacks_the_model(self):
         add_account("yazid", "/path/yazid")
