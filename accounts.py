@@ -97,6 +97,34 @@ def _default_registry() -> dict[str, Any]:
     }
 
 
+def _resolve_label(acc: dict[str, Any]) -> None:
+    """Runtime name of an account: the user's label, else its email, else its home folder.
+
+    The stored ``label`` is only what the user chose; an empty one falls back to the
+    email so every key (cooldown, session pin, lease) still has a stable name.
+    """
+    if not isinstance(acc, dict):
+        return
+    name = str(acc.get("label") or "").strip() or str(acc.get("email") or "").strip()
+    if not name and acc.get("home_dir"):
+        name = Path(str(acc["home_dir"])).name
+    acc["label"] = name
+
+
+def _storable_accounts(data: dict[str, Any]) -> dict[str, Any]:
+    """Copy of the registry where a label that merely repeats the email is stored empty."""
+    out = dict(data)
+    accounts = []
+    for acc in data.get("accounts", []):
+        acc = dict(acc)
+        email = str(acc.get("email") or "").strip()
+        if email and str(acc.get("label") or "").strip() == email:
+            acc["label"] = ""
+        accounts.append(acc)
+    out["accounts"] = accounts
+    return out
+
+
 def load_accounts() -> dict[str, Any]:
     """Load account registry. Fails open on missing or corrupt files."""
     path = get_accounts_file_path()
@@ -115,6 +143,8 @@ def load_accounts() -> dict[str, Any]:
             data["active_account"] = None
         if "rotation_mode" not in data:
             data["rotation_mode"] = "off"
+        for acc in data["accounts"]:
+            _resolve_label(acc)
         return data
     except Exception as exc:
         logger.warning("Failed to read Antigravity accounts registry %s: %s (failing open)", path, exc)
@@ -134,7 +164,7 @@ def save_accounts(data: dict[str, Any]) -> None:
     with _file_lock(lock_path):
         tmp_path = path.with_suffix(".tmp")
         try:
-            content = json.dumps(data, indent=2)
+            content = json.dumps(_storable_accounts(data), indent=2)
             tmp_path.write_text(content, encoding="utf-8")
             try:
                 tmp_path.chmod(0o600)
@@ -256,14 +286,17 @@ def add_account(
     email: str | None = None,
 ) -> dict[str, Any]:
     """Add or update an account entry in the registry."""
-    norm_label = label.strip()
+    norm_email = (email or "").strip()
+    norm_label = (label or "").strip() or norm_email
+    if not norm_label:
+        norm_label = Path(home_dir).expanduser().name
     norm_home = str(Path(home_dir).expanduser().resolve())
     data = load_accounts()
     accounts = data.get("accounts", [])
 
     target = None
     for acc in accounts:
-        if acc.get("label") == norm_label:
+        if acc.get("label") == norm_label or (norm_email and acc.get("email") == norm_email):
             target = acc
             break
 

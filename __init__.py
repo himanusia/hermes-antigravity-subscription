@@ -300,7 +300,7 @@ def antigravity_auth_handler(action: str, args: Any) -> bool:
                 "so you can complete the browser-based Google authentication."
             )
 
-        user_label = (getattr(args, "label", None) or "").strip()
+        user_label = (getattr(args, "label", None) or "").strip()  # optional; empty = use the email
         accounts_dir = get_accounts_dir()
         accounts_dir.mkdir(parents=True, exist_ok=True)
         with contextlib.suppress(OSError):
