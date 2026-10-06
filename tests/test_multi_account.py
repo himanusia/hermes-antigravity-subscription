@@ -598,7 +598,7 @@ class TestMultiAccount(unittest.TestCase):
 
             with patch("subprocess.run", side_effect=mock_run_side_effect) as mock_run, \
                  patch("__init__.resolve_agy_command", return_value="agy"), \
-                 patch("__init__.check_account_eligibility", return_value=(True, None)):
+                 patch("__init__.probe_account_state", return_value=("ok", None)):
                 res = auth_handler("add", SimpleNamespace(label="test_add"))
                 self.assertTrue(res)
                 accounts = list_accounts()
@@ -618,7 +618,7 @@ class TestMultiAccount(unittest.TestCase):
 
             with patch("subprocess.run", side_effect=mock_run_side_effect), \
                  patch("__init__.resolve_agy_command", return_value="agy"), \
-                 patch("__init__.check_account_eligibility", return_value=(True, None)):
+                 patch("__init__.probe_account_state", return_value=("ok", None)):
                 res = auth_handler("add", SimpleNamespace(label=""))
                 self.assertTrue(res)
                 accounts = list_accounts()
@@ -637,7 +637,7 @@ class TestMultiAccount(unittest.TestCase):
 
             with patch("subprocess.run", side_effect=mock_run_side_effect), \
                  patch("__init__.resolve_agy_command", return_value="agy"), \
-                 patch("__init__.check_account_eligibility", return_value=(True, None)):
+                 patch("__init__.probe_account_state", return_value=("ok", None)):
                 res = auth_handler("add", SimpleNamespace(label="keychain_test"))
                 self.assertTrue(res)
                 accounts = list_accounts()
@@ -661,7 +661,7 @@ class TestMultiAccount(unittest.TestCase):
 
             with patch("subprocess.run", side_effect=mock_run_side_effect), \
                  patch("__init__.resolve_agy_command", return_value="agy"), \
-                 patch("__init__.check_account_eligibility", return_value=(False, None)):
+                 patch("__init__.probe_account_state", return_value=("not_eligible", None)):
                 res = auth_handler("add", SimpleNamespace(label="ineligible_acc"))
                 self.assertTrue(res)
                 accounts = list_accounts()
@@ -701,7 +701,7 @@ class TestMultiAccount(unittest.TestCase):
         self.assertTrue(res)
         val = out.getvalue()
         self.assertIn("(host default)", val)
-        self.assertIn("Eligible", val)
+        self.assertIn("State", val)
         self.assertIn("Home:", val)
         self.assertIn("No additional Antigravity accounts registered", val)
 
@@ -721,7 +721,9 @@ class TestMultiAccount(unittest.TestCase):
         add_account("acc_ok", "/path/ok", eligible=True)
         add_account("acc_bad", "/path/bad", eligible=False)
         out = io.StringIO()
-        with patch("sys.stdout", out), patch("__init__.fetch_usage_for_home", return_value=None):
+        probe = lambda home, *a, **k: (("not_eligible", None) if "bad" in str(home) else ("ok", None))
+        with patch("sys.stdout", out), patch("__init__.probe_account_state", side_effect=probe), \
+             patch("__init__.fetch_usage_for_home", return_value=None):
             res = auth_handler("status", SimpleNamespace())
         self.assertTrue(res)
         warnings = [line for line in out.getvalue().splitlines() if line.startswith("WARNING")]
@@ -887,7 +889,7 @@ class HardeningTests(unittest.TestCase):
 
             with patch("subprocess.run", side_effect=mock_run_side_effect) as mock_run, \
                  patch("__init__.resolve_agy_command", return_value="agy"), \
-                 patch("__init__.check_account_eligibility", return_value=(True, None)):
+                 patch("__init__.probe_account_state", return_value=("ok", None)):
                 auth_handler("add", SimpleNamespace(label="bounded"))
         kwargs = mock_run.call_args[1]
         self.assertIn("timeout", kwargs)

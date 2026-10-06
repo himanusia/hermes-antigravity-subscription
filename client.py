@@ -58,6 +58,8 @@ try:
         get_rotation_mode,
         is_model_unavailable_error,
         is_quota_error,
+        is_login_error,
+        record_account_state,
         acquire_lease,
         lease_account,
         release_lease,
@@ -110,6 +112,8 @@ except ImportError:
         get_rotation_mode,
         is_model_unavailable_error,
         is_quota_error,
+        is_login_error,
+        record_account_state,
         acquire_lease,
         lease_account,
         release_lease,
@@ -393,7 +397,10 @@ class _RotatingStreamWrapper:
         if self.chunks_yielded > 0 or len(self.tried_labels) >= self.max_attempts:
             return False
         model_gone = _model_unavailable_here(self.current_account, self.resolved_model, exc)
-        if not model_gone and not is_quota_error(exc):
+        login_gone = is_login_error(exc)
+        if login_gone and str(self.current_account.get("label") or "").strip():
+            record_account_state(str(self.current_account["label"]), "needs_login")
+        if not model_gone and not login_gone and not is_quota_error(exc):
             return False
 
         with contextlib.suppress(Exception):
@@ -402,7 +409,7 @@ class _RotatingStreamWrapper:
         # The host default account has no registry entry: nothing to cool down,
         # and no label to exclude.
         current_label = str(self.current_account.get("label") or "").strip()
-        if current_label and not model_gone:
+        if current_label and not model_gone and not login_gone:
             # Lacking a model is not a quota problem: the account stays usable for others.
             cooldown_ts = _resolve_cooldown_reset(self.current_account, self.resolved_model)
             set_cooldown(current_label, until=cooldown_ts)
@@ -1153,6 +1160,10 @@ class AntigravityClient:
                 except Exception as exc:
                     # The stream never came back: nothing owns the lease yet.
                     release_lease(label)
+                    if is_login_error(exc):
+                        record_account_state(label, "needs_login")
+                        last_exc = exc
+                        continue
                     if not _model_unavailable_here(account, resolved_model, exc):
                         raise
                     last_exc, model_gone = exc, True
@@ -1179,6 +1190,10 @@ class AntigravityClient:
             except Exception as exc:
                 if _model_unavailable_here(account, resolved_model, exc):
                     last_exc, model_gone = exc, True
+                    continue
+                if is_login_error(exc):
+                    record_account_state(label, "needs_login")
+                    last_exc = exc
                     continue
                 if is_quota_error(exc):
                     last_exc = exc

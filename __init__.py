@@ -18,6 +18,11 @@ try:
         DEFAULT_ACCOUNTS_DIR,
         add_account,
         check_account_eligibility,
+        probe_account_state,
+        record_account_state,
+        STATE_OK,
+        STATE_NEEDS_LOGIN,
+        STATE_NOT_ELIGIBLE,
         extract_email_from_token_file,
         fetch_usage_for_home,
         find_account_token_path,
@@ -36,6 +41,11 @@ except ImportError:
         DEFAULT_ACCOUNTS_DIR,
         add_account,
         check_account_eligibility,
+        probe_account_state,
+        record_account_state,
+        STATE_OK,
+        STATE_NEEDS_LOGIN,
+        STATE_NOT_ELIGIBLE,
         extract_email_from_token_file,
         fetch_usage_for_home,
         find_account_token_path,
@@ -364,24 +374,10 @@ def antigravity_auth_handler(action: str, args: Any) -> bool:
             final_label = user_label
             final_home = home_dir
         else:
-            if extracted_email:
-                final_label = extracted_email
-            else:
-                if sys.stdin.isatty():
-                    try:
-                        final_label = input("Account label: ").strip()
-                    except (EOFError, KeyboardInterrupt):
-                        final_label = ""
-                else:
-                    final_label = ""
-                if not final_label:
-                    existing_labels = {acc.get("label") for acc in list_accounts()}
-                    idx = len(existing_labels) + 1
-                    while f"account-{idx}" in existing_labels:
-                        idx += 1
-                    final_label = f"account-{idx}"
+            # Label stays empty unless the user passed --label; the email names the account.
+            final_label = extracted_email or ""
 
-            folder_name = sanitize_folder_name(final_label)
+            folder_name = sanitize_folder_name(final_label) if final_label else home_dir.name.lstrip(".")
             final_home = accounts_dir / folder_name
             if home_dir != final_home:
                 if final_home.exists():
@@ -391,7 +387,8 @@ def antigravity_auth_handler(action: str, args: Any) -> bool:
                     final_home.chmod(0o700)
 
         # Check eligibility
-        is_eligible, usage_data = check_account_eligibility(final_home)
+        probed_state, usage_data = probe_account_state(final_home)
+        is_eligible = probed_state != STATE_NOT_ELIGIBLE
 
         add_account(
             label=final_label,
@@ -400,8 +397,11 @@ def antigravity_auth_handler(action: str, args: Any) -> bool:
             eligible=is_eligible,
             email=extracted_email,
         )
+        record_account_state(final_label or extracted_email or final_home.name, probed_state)
 
-        print(f"Successfully saved account '{final_label}' to registry.")
+        print(f"Successfully saved account '{final_label or extracted_email or final_home.name}' to registry.")
+        if probed_state == STATE_NEEDS_LOGIN:
+            print("WARNING: login did not complete; run `hermes auth add antigravity-subscription-directsdk` again.")
         if is_eligible:
             # Eligible accounts stay quiet: no warning, just the current quota.
             if usage_data:
@@ -429,8 +429,8 @@ def antigravity_auth_handler(action: str, args: Any) -> bool:
         if rotation_mode == "fixed":
             print(f"Pinned account: {active or '(none; using host default)'}")
 
-        headers = ["Label", "Active", "Enabled", "Eligible", "Cooldown", "Gemini (5h / Wk)", "Claude/GPT (5h / Wk)"]
-        row_format = "{:<22} {:<8} {:<9} {:<10} {:<12} {:<20} {:<20}"
+        headers = ["Account", "Active", "Enabled", "State", "Cooldown", "Gemini (5h / Wk)", "Claude/GPT (5h / Wk)"]
+        row_format = "{:<22} {:<8} {:<9} {:<13} {:<12} {:<20} {:<20}"
         divider = "-" * 105
         print(row_format.format(*headers))
         print(divider)
@@ -465,14 +465,15 @@ def antigravity_auth_handler(action: str, args: Any) -> bool:
             lbl = acc.get("label", "")
             is_act = "*" if (not is_host_active and lbl == active) else ""
             en = "yes" if acc.get("enabled", True) else "no"
-            elig = "yes" if acc.get("eligible", True) else "no"
             cd_until = acc.get("cooldown_until", 0.0)
             if cd_until > now:
                 cd_str = f"{int(cd_until - now)}s"
             else:
                 cd_str = "ready"
 
-            usage = fetch_usage_for_home(acc.get("home_dir", ""), cached=False)
+            state, usage = probe_account_state(acc.get("home_dir", ""))
+            record_account_state(lbl, state)
+            elig = state
             if usage:
                 g_5h = usage.get("gemini", {}).get("5h", {}).get("remaining_fraction")
                 g_wk = usage.get("gemini", {}).get("weekly", {}).get("remaining_fraction")
@@ -492,9 +493,16 @@ def antigravity_auth_handler(action: str, args: Any) -> bool:
             print("Run `hermes auth add antigravity-subscription-directsdk` to add an account.")
 
         # Warn only about accounts that cannot be used; eligible accounts stay quiet.
-        ineligible = [acc.get("label", "") for acc in accounts if not acc.get("eligible", True)]
-        if ineligible:
-            print(f"\nWARNING: not eligible for Antigravity (skipped by rotation): {', '.join(ineligible)}")
+        by_state: dict[str, list[str]] = {}
+        for acc in list_accounts():
+            st = acc.get("state")
+            if st in (STATE_NEEDS_LOGIN, STATE_NOT_ELIGIBLE):
+                by_state.setdefault(st, []).append(acc.get("label", ""))
+        if by_state.get(STATE_NEEDS_LOGIN):
+            print(f"\nWARNING: needs login (skipped by rotation): {', '.join(by_state[STATE_NEEDS_LOGIN])}")
+            print("  Fix: hermes auth add antigravity-subscription-directsdk")
+        if by_state.get(STATE_NOT_ELIGIBLE):
+            print(f"\nWARNING: not eligible for Antigravity (skipped by rotation): {', '.join(by_state[STATE_NOT_ELIGIBLE])}")
 
         return True
 

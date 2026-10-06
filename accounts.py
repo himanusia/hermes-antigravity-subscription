@@ -278,6 +278,73 @@ def check_account_eligibility(
         return False, None
 
 
+STATE_OK = "ok"
+STATE_NEEDS_LOGIN = "needs_login"
+STATE_NOT_ELIGIBLE = "not_eligible"
+STATE_UNKNOWN = "unknown"
+
+_NEEDS_LOGIN_MARKERS = (
+    "authentication required",
+    "please sign in",
+    "not logged into antigravity",
+    "not logged in",
+    "visit the url to log in",
+)
+
+
+def classify_probe_output(stdout: str, stderr: str, returncode: int) -> str:
+    """Map an `agy -p /usage` result to ok / needs_login / not_eligible / unknown."""
+    combined = f"{stdout}\n{stderr}".lower()
+    if any(m in combined for m in _NEEDS_LOGIN_MARKERS):
+        return STATE_NEEDS_LOGIN
+    if "eligibility check failed" in combined or "not eligible" in combined:
+        return STATE_NOT_ELIGIBLE
+    if returncode == 0 and _parse_usage_json(stdout) is not None:
+        return STATE_OK
+    return STATE_UNKNOWN
+
+
+def probe_account_state(home_dir: str | Path, timeout: float = 30.0) -> tuple[str, dict[str, Any] | None]:
+    """Read-only state of one account: (state, usage). Never starts a login."""
+    norm_home = str(Path(home_dir).expanduser().resolve())
+    try:
+        cmd = resolve_agy_command()
+        res = subprocess.run(
+            [cmd, "-p", "/usage", "--output-format", "json"],
+            env=probe_env(norm_home), capture_output=True, text=True,
+            timeout=timeout, check=False, stdin=subprocess.DEVNULL,
+        )
+    except Exception as exc:
+        logger.debug("probe_account_state failed for %s: %s", norm_home, exc)
+        return STATE_UNKNOWN, None
+    state = classify_probe_output(res.stdout or "", res.stderr or "", res.returncode)
+    usage = _parse_usage_json(res.stdout) if state == STATE_OK else None
+    if usage is not None:
+        with _USAGE_CACHE_LOCK:
+            _USAGE_CACHE[norm_home] = (time.monotonic(), usage)
+    return state, usage
+
+
+def record_account_state(label: str, state: str) -> None:
+    """Persist the last probed state; not_eligible also flips ``eligible`` off."""
+    data = load_accounts()
+    changed = False
+    for acc in data.get("accounts", []):
+        if acc.get("label") != label:
+            continue
+        if acc.get("state") != state:
+            acc["state"] = state
+            changed = True
+        if state == STATE_NOT_ELIGIBLE and acc.get("eligible", True):
+            acc["eligible"] = False
+            changed = True
+        elif state == STATE_OK and not acc.get("eligible", True):
+            acc["eligible"] = True
+            changed = True
+    if changed:
+        save_accounts(data)
+
+
 def add_account(
     label: str,
     home_dir: str,
@@ -861,6 +928,12 @@ def maybe_quota_ignition(
     return True
 
 
+def is_login_error(error: Exception | str) -> bool:
+    """The account's session is gone (logged out / refresh token rejected)."""
+    msg = str(error).lower()
+    return any(m in msg for m in _NEEDS_LOGIN_MARKERS)
+
+
 def is_quota_error(error: Exception | str) -> bool:
     """Detect quota exhaustion across error types, messages, and codes."""
     msg = str(error).lower()
@@ -913,6 +986,8 @@ def _account_passes_gates(acc: dict[str, Any], now: float) -> bool:
     if not acc.get("enabled", True):
         return False
     if not acc.get("eligible", True):
+        return False
+    if acc.get("state") == STATE_NEEDS_LOGIN:
         return False
     if float(acc.get("cooldown_until", 0.0) or 0.0) > now:
         return False
